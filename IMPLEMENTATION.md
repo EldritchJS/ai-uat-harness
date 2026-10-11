@@ -702,7 +702,7 @@ See [`test_lib/README.md`](test_lib/README.md) for detailed documentation of the
 
 **CI pipeline** (`.github/workflows/ci.yaml`): two GitHub Actions jobs triggered on push/PR to `main`:
 - `lint`: runs `ruff check` + `ruff format --check`
-- `test`: matrix across Python 3.10–3.13, installs dependencies, runs `pytest tests/ -v`
+- `test`: matrix across Python 3.11–3.14, installs dependencies, runs `pytest tests/ -v`
 
 ## Known Constraints
 

@@ -50,7 +50,7 @@ import sys
 import threading
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from kubernetes import client, config, watch
@@ -94,7 +94,7 @@ _KEEP_CONFIGMAPS = {
     "odh-kserve-custom-ca-bundle",
 }
 
-_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 # manual_runner groups every lifecycle item ahead of the tests for its
 # interactive picker, but an unattended run needs true execution order:
@@ -104,7 +104,7 @@ _POST_TEST_LIFECYCLE = ("aggregate", "cleanup")
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class AutoRunner:
@@ -612,7 +612,7 @@ class AutoRunner:
             # since_seconds is coarse; per-line ts<=last_ts dedupe below covers
             # any overlap it pulls back in.
             try:
-                delta = _now() - datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+                delta = _now() - datetime.fromisoformat(last_ts)
                 kwargs["since_seconds"] = max(1, int(delta.total_seconds()) + 1)
             except ValueError:
                 pass
