@@ -62,7 +62,7 @@ var _ = Describe("iperf3 TCP Bandwidth", func() {
 		It("should measure non-zero TCP bandwidth", func() {
 			Expect(os.MkdirAll(resultsDir, 0755)).To(Succeed())
 
-			cmd := exec.Command("iperf3", "-c", serverHost, "-t", "10", "-J")
+			cmd := exec.Command("iperf3", "-c", serverHost, "-t", "10", "-O", "2", "-P", "8", "-J")
 			output, err := cmd.CombinedOutput()
 			GinkgoWriter.Printf("iperf3 output:\n%s\n", string(output))
 			Expect(err).NotTo(HaveOccurred(), "iperf3 failed: %s", string(output))
