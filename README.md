@@ -901,6 +901,7 @@ templates/
   *.sh.j2             Jinja2 templates for shell scripts
 examples/
   all_tests.yaml      Test suite (test execution order, scopes, failure policies)
+  <test>.yaml         One suite per test, for running a single test on its own
 test_lib/             Test library (test definitions, Go source)
 cluster/              Cluster configs
 config.yaml           Tool config
