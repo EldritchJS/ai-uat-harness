@@ -322,7 +322,7 @@ The test uses `permutation` placement with `setSize: 2`, so for N nodes it produ
 ### Pass-fail assertions
 
 1. TCP connection to server on port 5201 succeeds within 10 seconds
-2. `iperf3 -c <host> -t 10 -J` runs successfully and measured bandwidth is greater than zero
+2. `iperf3 -c <host> -t 10 -O 2 -P 8 -J` runs successfully and measured bandwidth is greater than zero
 
 Bandwidth in Gbps is reported via Ginkgo `AddReportEntry`.
 
@@ -333,6 +333,8 @@ At least 2 nodes must be present in the cluster. The pod network must allow TCP 
 ### Design rationale
 
 The test uses `permutation` placement rather than `combination` because A->B and B->A are tested separately. Asymmetric bandwidth (due to network topology, switch oversubscription, or misconfigured QoS) would only show up if both directions are measured independently. The `-J` flag produces JSON output which is parsed directly for the `bits_per_second` value.
+
+The client runs 8 parallel streams (`-P 8`) and omits the first 2 seconds (`-O 2`) so the result reflects what the link can carry rather than what one TCP stream can. A single stream is limited by one CPU core, especially on an overlay network with a small MTU.
 
 
 ---
