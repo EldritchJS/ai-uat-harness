@@ -243,7 +243,7 @@ setup/prewarm-images.sh cluster/oac-dev-workload0.yaml
 
 ### Prerequisites
 
-- Python 3.10+
+- Python 3.11+
 - An OpenShift cluster with `oc` configured
 - A PVC with **ReadWriteMany (RWX)** access mode (e.g. CephFS, NFS). Multi-node runs pin pods to different nodes that share one PVC — RWO block storage will fail at scheduling.
 - A separate RWX PVC for model weights, referenced via `storage.models.pvc` in the cluster config (see [Cluster Setup](#cluster-setup))
