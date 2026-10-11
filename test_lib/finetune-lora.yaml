@@ -66,7 +66,7 @@ spec:
                   tolerations:
                     - key: nvidia.com/gpu.product
                       operator: Exists
-                      effect: NoExecute
+                      effect: NoSchedule
                   containers:
                     - name: pytorch
                       image: '{{ serverConfig.trainImage }}'
@@ -432,7 +432,7 @@ spec:
                   tolerations:
                     - key: nvidia.com/gpu.product
                       operator: Exists
-                      effect: NoExecute
+                      effect: NoSchedule
                   containers:
                     - name: ray-head
                       image: '{{ serverConfig.rayImage }}'
@@ -485,7 +485,7 @@ spec:
                     tolerations:
                       - key: nvidia.com/gpu.product
                         operator: Exists
-                        effect: NoExecute
+                        effect: NoSchedule
                     containers:
                       - name: ray-worker
                         image: '{{ serverConfig.rayImage }}'

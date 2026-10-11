@@ -29,7 +29,7 @@ spec:
   tolerations:
     - key: nvidia.com/gpu.product
       operator: Exists
-      effect: NoExecute
+      effect: NoSchedule
 {% if privileged %}
   hostPID: true
 {% endif %}
