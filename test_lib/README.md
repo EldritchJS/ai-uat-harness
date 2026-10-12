@@ -1,7 +1,7 @@
 <!-- Assisted by Claude Opus -->
 # Test Library
 
-This directory contains the test definitions used to validate AI inference platforms on OpenShift. Each test consists of a YAML definition that the UAT framework consumes and a Ginkgo test file that gets compiled into a binary and run inside a pod. A separate test suite YAML file controls which tests run, in what order, and what happens when one fails.
+This directory contains the test definitions used to validate AI platforms on OpenShift. Each test consists of a YAML definition that the UAT framework consumes and a Ginkgo test file that gets compiled into a binary and run inside a pod. A separate test suite YAML file controls which tests run, in what order, and what happens when one fails.
 
 ## Categories
 
@@ -24,6 +24,13 @@ Model serving through cluster operators and CRDs.
 | Test | Description |
 |------|-------------|
 | [kserve](#6-kserve) | KServe InferenceService deployment and inference validation |
+
+### Fine-Tuning
+Model fine-tuning through the training operators, and serving the result.
+
+| Test | Description |
+|------|-------------|
+| [finetune-lora](#17-finetune-lora) | LoRA fine-tuning with Kubeflow and KubeRay, then serving both adapters |
 
 ### Single-GPU Performance
 Inference benchmarks on a single GPU.
@@ -1014,3 +1021,68 @@ The VM cannot mount the harness folders, so the client pod drives it through fio
 In that mode fio accepts the job only as a job file, so the test turns the sweep entry's options after `--client` into one.
 
 The test supports cluster and project scope but not node scope. The disk is a single image on one PVC, and node scope would start a VM on every node at once, all attaching it. Cluster scope with `setSize: 1` pins the VM and the client pod to one node from the cluster file and runs the nodes one after another; `setSelection: all` with `setCutoff: 1` uses the first node. Running `fio` with the same placement puts both tests on the same node. At project scope the scheduler picks the node.
+
+
+---
+
+## 17. finetune-lora
+
+### Purpose
+
+This test validates the fine-tuning path end to end: two training operators each LoRA fine-tune the same base model, and a model server then loads and serves both results. It confirms that the Kubeflow Training Operator and KubeRay can run multi-GPU training jobs, and that the adapters they produce are usable.
+
+### Architecture
+
+```
+train-kubeflow [resourceConfig, PyTorchJob, 2 GPUs]  --+
+                                                       +--> adapters on /uat_scratchpad
+train-kuberay  [resourceConfig, RayJob, 2 GPUs]      --+
+    |
+wait-adapters [ephemeral, waits for both adapters]
+    |
+vllm-server [persistent, 1 GPU, base model plus both adapters]
+    |
+    +--- query [pass-fail, ephemeral]
+    +--- query-quant [quantitative, ephemeral]
+```
+
+The two training jobs are resource steps, which the harness applies without waiting. `wait-adapters` is the gate: it blocks until both jobs have written their adapter to the scratchpad, so serving only starts after training has finished.
+
+### Infrastructure
+
+| Name | Image | GPUs | Service | Key config |
+|------|-------|------|---------|------------|
+| train-kubeflow | `pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime` | 2 (`serverConfig.gpuCount`) | none | `kubeflow.org/v1` PyTorchJob, `torchrun` with one rank per GPU |
+| train-kuberay | `rayproject/ray-ml:2.20.0-py310-gpu` | 2 (`serverConfig.gpuCount`) | none | `ray.io/v1` RayJob running Ray Train |
+| wait-adapters | `registry.redhat.io/ubi9/ubi:9.8` | none | none | waits up to 3300 seconds for both `adapter_config.json` files |
+| vllm-server | `vllm/vllm-openai:v0.6.6` | 1 | headless ClusterIP :8080 | `--enable-lora --max-loras=2`, adapters loaded from the scratchpad |
+| query | `registry.redhat.io/ubi9/ubi:9.8` | none | none | `SERVER_URL`, model ids and `PROMPT` env |
+| query-quant | `registry.redhat.io/ubi9/ubi:9.8` | none | none | same env as `query` |
+
+The base model is `Qwen/Qwen2.5-3B-Instruct` from the models PVC, the dataset is `tatsu-lab/alpaca`, and each job trains for 25 steps at LoRA rank 16. All of these are set in `serverConfig`.
+
+### Pass-fail assertions
+
+1. The model server is healthy
+2. The base model and both adapters are registered
+3. Inference succeeds against the base model
+4. Inference succeeds against the Kubeflow adapter
+5. Inference succeeds against the KubeRay adapter
+
+### Quantitative tests
+
+One chat request is sent to each of the base model, the Kubeflow adapter and the KubeRay adapter. Each must return a non-empty response. Completion tokens, latency in seconds and throughput in tokens per second are reported per model via Ginkgo `AddReportEntry`.
+
+### Prerequisites
+
+The Kubeflow Training Operator and KubeRay must be installed, with the `kubeflow.org` and `ray.io` API groups available, and the namespace needs permission to create PyTorchJobs and RayJobs. The models PVC must contain the base model. The training pods install their Python dependencies with pip when they start and load the dataset from Hugging Face, so they need outbound access to both.
+
+### Design rationale
+
+Both operators train the same model on the same data, and the quantitative step records tokens, latency and throughput for each so the frameworks can be compared.
+
+The scratchpad is how the steps hand data to each other: the DAG has no other way to pass the adapters from the training steps to the serving step.
+
+The training jobs use stock framework images, with the training script embedded in the job and the dependencies installed when it starts.
+
+The test supports project scope only.
