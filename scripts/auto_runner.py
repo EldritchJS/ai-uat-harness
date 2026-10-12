@@ -83,6 +83,7 @@ _CRD_TYPES = [
     ("ray.io", "v1", "rayjobs"),
     ("ray.io", "v1", "rayclusters"),
     ("ray.io", "v1", "rayservices"),
+    ("kubevirt.io", "v1", "virtualmachines"),
 ]
 
 # Platform-injected configmaps to keep during preflight — cluster CA bundles and

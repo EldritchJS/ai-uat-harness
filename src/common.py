@@ -365,9 +365,11 @@ def build_resource_name(
     stp = fit(step, 16).ljust(16, "-") if step else "-" * 16
     sk = fit(set_key, 4, strict=True).ljust(4, "-") if set_key else "-" * 4
     swp = fit(sweep, 8).ljust(8, "-") if sweep else "-" * 8
-    if resource_type == "crd":
+    if resource_type == "crd" and not node:
         return f"ua-{tid}-{resource_type}-{stp}-{sk}-t"
     nod = fit(node, 10).ljust(10, "-") if node else "-" * 10
+    if resource_type == "crd":
+        return f"ua-{tid}-{resource_type}-{stp}-{nod}-{sk}-t"
     return f"ua-{tid}-{resource_type}-{stp}-{nod}-{sk}-{swp}-t"
 
 

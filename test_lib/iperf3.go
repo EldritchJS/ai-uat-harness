@@ -15,7 +15,16 @@ import (
 )
 
 type IperfResult struct {
-	End IperfEnd `json:"end"`
+	Start IperfStart `json:"start"`
+	End   IperfEnd   `json:"end"`
+}
+
+type IperfStart struct {
+	TestStart IperfTestStart `json:"test_start"`
+}
+
+type IperfTestStart struct {
+	NumStreams int `json:"num_streams"`
 }
 
 type IperfEnd struct {
@@ -62,7 +71,14 @@ var _ = Describe("iperf3 TCP Bandwidth", func() {
 		It("should measure non-zero TCP bandwidth", func() {
 			Expect(os.MkdirAll(resultsDir, 0755)).To(Succeed())
 
-			cmd := exec.Command("iperf3", "-c", serverHost, "-t", "10", "-O", "2", "-P", "8", "-J")
+			sweepCmdJSON := os.Getenv("SWEEP_COMMAND")
+			Expect(sweepCmdJSON).NotTo(BeEmpty(), "SWEEP_COMMAND must be set")
+
+			var sweepCmd []string
+			Expect(json.Unmarshal([]byte(sweepCmdJSON), &sweepCmd)).To(Succeed(), "Failed to parse SWEEP_COMMAND")
+			Expect(sweepCmd).NotTo(BeEmpty(), "SWEEP_COMMAND is empty")
+
+			cmd := exec.Command(sweepCmd[0], sweepCmd[1:]...)
 			output, err := cmd.CombinedOutput()
 			GinkgoWriter.Printf("iperf3 output:\n%s\n", string(output))
 			Expect(err).NotTo(HaveOccurred(), "iperf3 failed: %s", string(output))
@@ -70,11 +86,13 @@ var _ = Describe("iperf3 TCP Bandwidth", func() {
 			var result IperfResult
 			Expect(json.Unmarshal(output, &result)).To(Succeed())
 
+			streams := result.Start.TestStart.NumStreams
 			bps := result.End.SumReceived.BitsPerSecond
 			gbps := bps / 1e9
-			GinkgoWriter.Printf("TCP bandwidth: %.2f Gbps\n", gbps)
+			GinkgoWriter.Printf("TCP bandwidth with %d streams: %.2f Gbps\n", streams, gbps)
 			Expect(bps).To(BeNumerically(">", 0), "measured bandwidth is zero")
 
+			AddReportEntry("streams", streams)
 			AddReportEntry("bandwidth_gbps", gbps)
 		})
 	})

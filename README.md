@@ -198,9 +198,9 @@ DAG pods also get a second mount at `/binaries` for access to compiled test bina
 
 The `setup/` directory contains Kubernetes manifests and scripts for one-time cluster preparation:
 
-- **`user-namespaces-and-pvcs.yaml`** — creates the `uat-project`, `uat-peer`, and `uat-runner` namespaces (each labeled `massopen.cloud/project`), their PVCs, and RBAC. `uat-project` and `uat-peer` each get a 50Gi RWX PVC for test results (`uat-project-storage`, `uat-peer-storage`) and a 100Gi RWX PVC (`uat-models`) for pre-downloaded model weights, plus a namespace-scoped Role + RoleBinding granting the test user access to pods, services, configmaps, and (in `uat-project`) workload APIs (jobs, jobsets, kubeflow, kserve, ray). `uat-runner` gets the runner's workspace and binary PVCs (`uat-runner-storage` 100Gi, `uat-runner-bin` 10Gi) and the `uat-runner-sa` ServiceAccount, which is bound to the test-user Role in the other two namespaces. `uat-project` and `uat-peer` also get a NetworkPolicy that permits same-namespace pod-to-pod traffic plus external egress. It is needed because the cluster's BaselineAdminNetworkPolicy denies tenant traffic by default — including same-namespace east-west — so builds and pod-to-service communication would otherwise fail.
+- **`user-namespaces-and-pvcs.yaml`** — creates the `uat-project`, `uat-peer`, and `uat-runner` namespaces (each labeled `massopen.cloud/project`), their PVCs, and RBAC. `uat-project` and `uat-peer` each get a 50Gi RWX PVC for test results (`uat-project-storage`, `uat-peer-storage`) and a 100Gi RWX PVC (`uat-models`) for pre-downloaded model weights. `uat-project` also gets two PVCs that are attached to KubeVirt VMs as disks, `uat-project-storage-virt` (50Gi) and `uat-models-virt` (100Gi). Each of the two namespaces gets a namespace-scoped Role + RoleBinding granting the test user access to pods, services, configmaps, and (in `uat-project`) workload APIs (jobs, jobsets, kubeflow, kserve, ray). `uat-runner` gets the runner's workspace and binary PVCs (`uat-runner-storage` 100Gi, `uat-runner-bin` 10Gi) and the `uat-runner-sa` ServiceAccount, which is bound to the test-user Role in the other two namespaces. `uat-project` and `uat-peer` also get a NetworkPolicy that permits same-namespace pod-to-pod traffic plus external egress. It is needed because the cluster's BaselineAdminNetworkPolicy denies tenant traffic by default — including same-namespace east-west — so builds and pod-to-service communication would otherwise fail.
 - **`admin-namespace-and-pvcs.yaml`** — everything for the admin platform checks, kept separate because it needs cluster-admin to apply: the `uat-admin` namespace, a 50Gi RWX PVC for test results (`uat-admin-storage`), a `uat-sa` ServiceAccount, a namespace-scoped admin Role, the same NetworkPolicy the test namespaces get, and a **ClusterRole + ClusterRoleBinding** granting read access to cluster-scoped resources (nodes, deployments, DataScienceClusters, ClusterPolicies, NodeFeatureDiscoveries, ServiceMeshControlPlanes).
-- **`model-downloader.yaml`** — one-shot pods (one per namespace) that download HuggingFace models to the models PVC. Add models to the `MODELS` list and re-run.
+- **`model-downloader.yaml`** — one-shot pods (one per namespace) that download HuggingFace models to the models PVC, and a one-shot VM (`model-downloader-virt` in `uat-project`) that downloads the same models onto the `uat-models-virt` disk and powers off. Add models to the `MODELS` lists and re-run.
 - **`prewarm-images.sh`** — a script that pre-pulls ("warms") every container image used by the test library onto each GPU node in a cluster config, so real test runs don't stall or time out on first-time image pulls. Launches a throwaway pod per (node × image), waits for the pulls to cache, then deletes the pods. Run with `setup/prewarm-images.sh cluster/ocp-test.yaml`.
 - **`auto_runner.yaml`** — the `uat-runner` pod, which clones this repo, runs the build, and drives the whole suite unattended as the `uat-runner-sa` ServiceAccount. Its configuration is the `env` block: `REPO_URL`, `BUILD_CMD`, and an optional `REPO_BRANCH`. Set `REPO_BRANCH` to a branch or tag to run that instead of the default branch, so a change can be tested from a pushed branch before it is merged; leave it empty otherwise.
 
@@ -214,6 +214,8 @@ oc apply -f setup/model-downloader.yaml
 # wait for downloads to complete:
 oc logs -f model-downloader -n uat-project
 oc logs -f model-downloader -n uat-peer
+# once the VM reports Stopped, delete it:
+oc delete vm model-downloader-virt -n uat-project
 # optionally pre-pull test images onto the GPU nodes:
 setup/prewarm-images.sh cluster/ocp-test.yaml
 ```
@@ -235,6 +237,8 @@ oc apply -f setup/model-downloader.yaml
 # wait for downloads to complete:
 oc logs -f model-downloader -n uat-project
 oc logs -f model-downloader -n uat-peer
+# once the VM reports Stopped, delete it:
+oc delete vm model-downloader-virt -n uat-project
 # optionally pre-pull test images onto the GPU nodes:
 setup/prewarm-images.sh cluster/oac-dev-workload0.yaml
 ```

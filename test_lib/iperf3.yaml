@@ -34,11 +34,57 @@ spec:
         initialDelaySeconds: 5
         periodSeconds: 5
         failureThreshold: 6
+      resources:
+        requests:
+          cpu: 16
+          memory: 32Gi
+        limits:
+          cpu: 16
+          memory: 32Gi
       persistsThroughSweep: true
 
     - name: iperf-client
       image: docker.io/networkstatic/iperf3:latest
       labelFilter: pass-fail
+      resources:
+        requests:
+          cpu: 16
+          memory: 32Gi
+        limits:
+          cpu: 16
+          memory: 32Gi
       env:
         - name: SERVER_HOST
           value: '{{ services["iperf-server"].name }}'
+        - name: SWEEP_COMMAND
+          value: '{{ paramSweep.command | toJson }}'
+      parameterSweep:
+        baseCommand:
+          args:
+            - iperf3
+          flags:
+            client: '{{ services["iperf-server"].name }}'
+            time: 10
+            omit: 2
+            json: ~
+        entries:
+          - id: streams-1
+            description: 1 parallel stream
+            flags:
+              parallel: 1
+          - id: streams-2
+            description: 2 parallel streams
+            flags:
+              parallel: 2
+          - id: streams-4
+            description: 4 parallel streams
+            flags:
+              parallel: 4
+          - id: streams-8
+            description: 8 parallel streams
+            flags:
+              parallel: 8
+          - id: streams-16
+            description: 16 parallel streams
+            flags:
+              parallel: 16
