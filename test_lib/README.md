@@ -1,7 +1,7 @@
 <!-- Assisted by Claude Opus -->
 # Test Library
 
-This directory contains the test definitions used to validate AI inference platforms on OpenShift. Each test consists of a YAML definition that the UAT framework consumes and a Ginkgo test file that gets compiled into a binary and run inside a pod. A separate test suite YAML file controls which tests run, in what order, and what happens when one fails.
+This directory contains the test definitions used to validate AI platforms on OpenShift. Each test consists of a YAML definition that the UAT framework consumes and a Ginkgo test file that gets compiled into a binary and run inside a pod. A separate test suite YAML file controls which tests run, in what order, and what happens when one fails.
 
 ## Categories
 
@@ -14,6 +14,9 @@ Platform prerequisites. Checks that must pass before GPU workloads run.
 | [platform-check-admin](#2-platform-check-admin) | Operator health, CR status, DSC components, GPU node labels, required pods, Compliance Operator, RHACS |
 | [component](#3-component) | Node hardware and software validation |
 | [iperf3](#4-iperf3) | Inter-node TCP bandwidth |
+| [iperf3-virt](#14-iperf3-virt) | TCP bandwidth between a pod and a KubeVirt VM on the same node |
+| [fio](#15-fio) | Storage throughput, IOPS and latency on the results PVC from a pod |
+| [fio-virt](#16-fio-virt) | Storage throughput, IOPS and latency on a PVC attached to a KubeVirt VM as a disk |
 
 ### Operator
 Model serving through cluster operators and CRDs.
@@ -21,6 +24,13 @@ Model serving through cluster operators and CRDs.
 | Test | Description |
 |------|-------------|
 | [kserve](#6-kserve) | KServe InferenceService deployment and inference validation |
+
+### Fine-Tuning
+Model fine-tuning through the training operators, and serving the result.
+
+| Test | Description |
+|------|-------------|
+| [finetune-lora](#17-finetune-lora) | LoRA fine-tuning with Kubeflow and KubeRay, then serving both adapters |
 
 ### Single-GPU Performance
 Inference benchmarks on a single GPU.
@@ -52,6 +62,33 @@ Namespace isolation and cross-tenant performance impact. Isolation tests verify 
 | [ping](#11-ping) | Cross-namespace service connectivity |
 | [peer-load-high](#12-peer-load-high) | Inference performance under high cross-namespace GPU load |
 | [peer-load-low](#13-peer-load-low) | Inference performance under low cross-namespace GPU load |
+
+## Test Dimensions
+
+Every test sits somewhere on two dimensions:
+
+- **Functional vs performance.** A functional test asks whether something works. A performance test measures how well it works and records the numbers for analysis after the run.
+- **Horizontal vs vertical.** A horizontal test exercises a single layer of the AI stack on its own. A vertical test exercises several layers together, the way a real workload does.
+
+A vertical test detects that something is wrong but cannot say which layer is responsible. A horizontal test locates the problem in its layer. The two are meant to be read together: when a vertical test gives an unexpected result, the horizontal tests for the layers it depends on show where to look.
+
+```
+                       Horizontal                     Vertical
+                    (one layer alone)         (several layers together)
+               +--------------------------+----------------------------+
+               |  platform-check          |  dev-env                   |
+  Functional   |  platform-check-admin    |  kserve                    |
+  (does it     |  component               |  finetune-lora             |
+   work?)      |  ping                    |                            |
+               +--------------------------+----------------------------+
+               |  iperf3                  |  guidellm                  |
+  Performance  |  iperf3-virt             |  inference-perf            |
+  (how well    |  fio                     |  chunked-prefill           |
+   does it     |  fio-virt                |  llm-d-local               |
+   work?)      |                          |  peer-load-high            |
+               |                          |  peer-load-low             |
+               +--------------------------+----------------------------+
+```
 
 ## Tests
 
@@ -307,7 +344,7 @@ This test measures TCP bandwidth between every pair of nodes in the cluster usin
 ```
 iperf-server [persistent, node 0 of pair]
     |
-    +--- iperf-client [pass-fail, ephemeral, node 1 of pair]
+    +--- iperf-client [pass-fail, ephemeral, node 1 of pair, one pod per sweep entry]
 ```
 
 The test uses `permutation` placement with `setSize: 2`, so for N nodes it produces N*(N-1) test runs covering every ordered pair (A->B and B->A are separate tests). This catches asymmetric bandwidth issues caused by network topology or switch oversubscription.
@@ -316,15 +353,29 @@ The test uses `permutation` placement with `setSize: 2`, so for N nodes it produ
 
 | Name | Image | GPUs | Service | Key config |
 |------|-------|------|---------|------------|
-| iperf-server | `networkstatic/iperf3:latest` | none | headless ClusterIP :5201 | `iperf3 -s` |
-| iperf-client | `networkstatic/iperf3:latest` | none | none | `SERVER_HOST` env |
+| iperf-server | `networkstatic/iperf3:latest` | none | headless ClusterIP :5201 | `iperf3 -s`, 16 CPU and 32Gi requests and limits |
+| iperf-client | `networkstatic/iperf3:latest` | none | none | `SERVER_HOST` and `SWEEP_COMMAND` env, 16 CPU and 32Gi requests and limits |
+
+### Parameter sweep
+
+The client step sweeps the number of parallel TCP streams. The base command is `iperf3 --client=<host> --time=10 --omit=2 --json`:
+
+| ID | Parallel streams |
+|----|------------------|
+| `streams-1` | 1 |
+| `streams-2` | 2 |
+| `streams-4` | 4 |
+| `streams-8` | 8 |
+| `streams-16` | 16 |
 
 ### Pass-fail assertions
 
-1. TCP connection to server on port 5201 succeeds within 10 seconds
-2. `iperf3 -c <host> -t 10 -O 2 -P 8 -J` runs successfully and measured bandwidth is greater than zero
+Each sweep entry runs both assertions:
 
-Bandwidth in Gbps is reported via Ginkgo `AddReportEntry`.
+1. TCP connection to server on port 5201 succeeds within 10 seconds
+2. The sweep entry's iperf3 command runs successfully and measured bandwidth is greater than zero
+
+The stream count and the bandwidth in Gbps are reported via Ginkgo `AddReportEntry`.
 
 ### Prerequisites
 
@@ -332,9 +383,11 @@ At least 2 nodes must be present in the cluster. The pod network must allow TCP 
 
 ### Design rationale
 
-The test uses `permutation` placement rather than `combination` because A->B and B->A are tested separately. Asymmetric bandwidth (due to network topology, switch oversubscription, or misconfigured QoS) would only show up if both directions are measured independently. The `-J` flag produces JSON output which is parsed directly for the `bits_per_second` value.
+The test uses `permutation` placement rather than `combination` because A->B and B->A are tested separately. Asymmetric bandwidth (due to network topology, switch oversubscription, or misconfigured QoS) would only show up if both directions are measured independently. The `--json` flag produces JSON output which is parsed directly for the `bits_per_second` value.
 
-The client runs 8 parallel streams (`-P 8`) and omits the first 2 seconds (`-O 2`) so the result reflects what the link can carry rather than what one TCP stream can. A single stream is limited by one CPU core, especially on an overlay network with a small MTU.
+The sweep covers 1 to 16 parallel streams, and each run omits its first 2 seconds (`--omit=2`). A single stream is limited by one CPU core, especially on an overlay network with a small MTU, so the sweep shows both what one stream gets and where the link itself levels off.
+
+The sweep is on the client step rather than a separate step because a multi-node set pins each DAG step to a different node, so with `setSize: 2` the test can have exactly two steps.
 
 
 ---
@@ -800,3 +853,236 @@ Same as peer-load-high. See [peer-load-high prerequisites](#12-peer-load-high).
 ### Design rationale
 
 At 1 req/s the peer server processes requests with minimal queuing, so the GPUs are mostly idle between requests. Any performance degradation observed in the project-side sweep at this load level points to fixed overhead from co-tenancy (shared NVLink fabric, memory controller, PCIe bus arbitration, GPU context switching) rather than sustained compute contention. This makes peer-load-low the control for peer-load-high's experiment.
+
+
+---
+
+## 14. iperf3-virt
+
+### Purpose
+
+This test measures TCP bandwidth between a pod and a KubeVirt virtual machine on the same node. Read next to `iperf3` run at node scope, which measures pod to pod on the same node, the difference is the cost of the virtualization layer on the network path.
+
+### Architecture
+
+```
+server-vm [VirtualMachine, Fedora containerDisk, cloud-init installs and starts iperf3]
+    |
+server-svc [headless Service :5201 selecting the VM's launcher pod]
+    |
+    +--- iperf-client [pass-fail, ephemeral, same node, one pod per sweep entry]
+```
+
+### Infrastructure
+
+| Name | Kind | Key config |
+|------|------|------------|
+| server-vm | `kubevirt.io/v1` VirtualMachine | `quay.io/containerdisks/fedora:latest`, 16 cores and 32Gi requests and limits, masquerade interface with multiqueue, pinned to the node |
+| server-svc | Service | headless, port 5201, selects the VM by its template labels |
+| iperf-client | Pod, `networkstatic/iperf3:latest` | `SERVER_HOST`, `READY_TIMEOUT_SECONDS` and `SWEEP_COMMAND` env, 16 CPU and 32Gi requests and limits |
+
+### Parameter sweep
+
+The base command is `iperf3 --client=<host> --time=10 --omit=2 --json`. Each stream count runs in both directions:
+
+| ID | Direction | Parallel streams |
+|----|-----------|------------------|
+| `streams-1` to `streams-16` | pod to VM | 1, 2, 4, 8, 16 |
+| `reverse-1` to `reverse-16` | VM to pod (`--reverse`) | 1, 2, 4, 8, 16 |
+
+### Pass-fail assertions
+
+Each sweep entry runs both assertions:
+
+1. TCP connection to the VM on port 5201 succeeds within `readyTimeoutSeconds` (default 480)
+2. The sweep entry's iperf3 command runs successfully and measured bandwidth is greater than zero
+
+The time waited for the server, the direction, the stream count and the bandwidth in Gbps are reported via Ginkgo `AddReportEntry`.
+
+### Prerequisites
+
+OpenShift Virtualization must be installed and the node must be able to run VMs. The test namespace needs permission to create `virtualmachines`. The VM needs outbound access to the Fedora package mirrors to install iperf3 on first boot.
+
+### Design rationale
+
+The VM is a resource step, which the harness applies without waiting, so the client retries the connection until the guest has booted and installed iperf3. Only the first sweep entry pays that wait.
+
+Both directions are measured because sending and receiving take different paths through the guest's virtual NIC. There is no VM to VM case: the pod to pod and pod to VM results already isolate the cost of one VM.
+
+The VM and the pods in both this test and `iperf3` have the same CPU and memory requests and limits, one core per stream at the largest sweep entry, so the two tests can be compared directly.
+
+
+---
+
+## 15. fio
+
+### Purpose
+
+This test measures the storage behind the results PVC from a pod using fio: sequential throughput, random IOPS, and latency. It is the baseline for `fio-virt`.
+
+### Architecture
+
+```
+fio-runner [pass-fail, ephemeral, one pod per sweep entry]
+    builds fio once and caches the binary on the scratchpad
+    runs the sweep entry against /uat_scratchpad/fio-data
+```
+
+### Infrastructure
+
+| Name | Image | GPUs | Service | Key config |
+|------|-------|------|---------|------------|
+| fio-runner | `golang:1.26` | none | none | `FIO_VERSION` and `SWEEP_COMMAND` env, 16 CPU and 32Gi requests and limits |
+
+### Parameter sweep
+
+The base command is `fio --output-format=json --name=uat --directory=/uat_scratchpad/fio-data --size=1G --direct=1 --ioengine=psync --time_based --runtime=30 --group_reporting --unlink=1`:
+
+| ID | Pattern | Block size | Jobs |
+|----|---------|------------|------|
+| `seq-write-1`, `seq-write-16` | sequential write | 1M | 1, 16 |
+| `seq-read-1`, `seq-read-16` | sequential read | 1M | 1, 16 |
+| `rand-write-1`, `rand-write-16` | random write | 4k | 1, 16 |
+| `rand-read-1`, `rand-read-16` | random read | 4k | 1, 16 |
+
+### Pass-fail assertions
+
+Each sweep entry runs both assertions:
+
+1. A fio binary for the pinned version exists on the scratchpad, or builds from source successfully
+2. The sweep entry's fio command runs successfully and measured throughput is greater than zero
+
+The pattern, block size, job count, throughput in MB/s, IOPS, and p50 and p99 completion latency in ms are reported via Ginkgo `AddReportEntry`. The full fio JSON is saved as `fio.json` in the entry's results folder.
+
+### Prerequisites
+
+The pod needs outbound access to GitHub to fetch the fio source. Each job uses 1GB on the results PVC while it runs, so the 16-job entries need 16GB free.
+
+### Design rationale
+
+fio is built from a pinned release tag so that this test and `fio-virt` run the identical version, without depending on a prebuilt fio image. The builder image already has the compiler, and the build takes seconds.
+
+`--direct=1` bypasses the page cache, so the 1GB files measure the storage and not the node's memory. Each entry runs for a fixed 30 seconds over its files, so the footprint does not grow with the speed of the storage, and `--unlink=1` removes the files when the entry finishes.
+
+The I/O engine is `psync` because io_uring is not available to pods and the builder image has no libaio. Each job therefore has one request in flight, and the job count is the degree of parallelism.
+
+
+---
+
+## 16. fio-virt
+
+### Purpose
+
+This test measures the same storage class when a KubeVirt VM uses it as a disk. It runs the same fio sweep as `fio` inside a VM, so the difference between the two is the cost of the VM's storage path.
+
+### Architecture
+
+```
+server-vm [VirtualMachine, Fedora containerDisk, PVC attached as a disk and mounted at /uat_workspace,
+           cloud-init builds fio and starts `fio --server`]
+    |
+server-svc [headless Service :8765 selecting the VM's launcher pod]
+    |
+    +--- fio-client [pass-fail, ephemeral, one pod per sweep entry]
+             sends the sweep entry to the VM as a job file
+             receives the results over the same connection
+```
+
+### Infrastructure
+
+| Name | Kind | Key config |
+|------|------|------------|
+| server-vm | `kubevirt.io/v1` VirtualMachine | `quay.io/containerdisks/fedora:latest`, 16 cores and 32Gi requests and limits, `uat-project-storage-virt` as a virtio disk |
+| server-svc | Service | headless, port 8765, selects the VM by its template labels |
+| fio-client | Pod, `golang:1.26` | `FIO_VERSION`, `SERVER_HOST`, `READY_TIMEOUT_SECONDS` and `SWEEP_COMMAND` env, 16 CPU and 32Gi requests and limits |
+
+### Parameter sweep
+
+The same eight entries as `fio`, with `--client=<host>` added and `--directory=/uat_workspace`, the mount point of the disk inside the VM.
+
+### Pass-fail assertions
+
+Each sweep entry runs all three assertions:
+
+1. A fio binary for the pinned version exists on the scratchpad, or builds from source successfully
+2. TCP connection to the VM on port 8765 succeeds within `readyTimeoutSeconds` (default 480)
+3. The sweep entry's fio job runs successfully on the VM and measured throughput is greater than zero
+
+The time waited for the server and the same measurements as `fio` are reported via Ginkgo `AddReportEntry`. The full fio JSON is saved as `fio.json` in the entry's results folder.
+
+### Prerequisites
+
+OpenShift Virtualization must be installed and the test namespace needs permission to create `virtualmachines`. The `uat-project-storage-virt` PVC must exist. The VM and the client pod both need outbound access to GitHub, and the VM to the Fedora package mirrors.
+
+### Design rationale
+
+The VM cannot mount the harness folders, so the client pod drives it through fio's client/server mode: the VM does the I/O on its disk and returns the statistics to the client, which records them like any other test. Nothing is read from the VM's disk afterwards.
+
+In that mode fio accepts the job only as a job file, so the test turns the sweep entry's options after `--client` into one.
+
+The test supports cluster and project scope but not node scope. The disk is a single image on one PVC, and node scope would start a VM on every node at once, all attaching it. Cluster scope with `setSize: 1` pins the VM and the client pod to one node from the cluster file and runs the nodes one after another; `setSelection: all` with `setCutoff: 1` uses the first node. Running `fio` with the same placement puts both tests on the same node. At project scope the scheduler picks the node.
+
+
+---
+
+## 17. finetune-lora
+
+### Purpose
+
+This test validates the fine-tuning path end to end: two training operators each LoRA fine-tune the same base model, and a model server then loads and serves both results. It confirms that the Kubeflow Training Operator and KubeRay can run multi-GPU training jobs, and that the adapters they produce are usable.
+
+### Architecture
+
+```
+train-kubeflow [resourceConfig, PyTorchJob, 2 GPUs]  --+
+                                                       +--> adapters on /uat_scratchpad
+train-kuberay  [resourceConfig, RayJob, 2 GPUs]      --+
+    |
+wait-adapters [ephemeral, waits for both adapters]
+    |
+vllm-server [persistent, 1 GPU, base model plus both adapters]
+    |
+    +--- query [pass-fail, ephemeral]
+    +--- query-quant [quantitative, ephemeral]
+```
+
+The two training jobs are resource steps, which the harness applies without waiting. `wait-adapters` is the gate: it blocks until both jobs have written their adapter to the scratchpad, so serving only starts after training has finished.
+
+### Infrastructure
+
+| Name | Image | GPUs | Service | Key config |
+|------|-------|------|---------|------------|
+| train-kubeflow | `pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime` | 2 (`serverConfig.gpuCount`) | none | `kubeflow.org/v1` PyTorchJob, `torchrun` with one rank per GPU |
+| train-kuberay | `rayproject/ray-ml:2.20.0-py310-gpu` | 2 (`serverConfig.gpuCount`) | none | `ray.io/v1` RayJob running Ray Train |
+| wait-adapters | `registry.redhat.io/ubi9/ubi:9.8` | none | none | waits up to 3300 seconds for both `adapter_config.json` files |
+| vllm-server | `vllm/vllm-openai:v0.6.6` | 1 | headless ClusterIP :8080 | `--enable-lora --max-loras=2`, adapters loaded from the scratchpad |
+| query | `registry.redhat.io/ubi9/ubi:9.8` | none | none | `SERVER_URL`, model ids and `PROMPT` env |
+| query-quant | `registry.redhat.io/ubi9/ubi:9.8` | none | none | same env as `query` |
+
+The base model is `Qwen/Qwen2.5-3B-Instruct` from the models PVC, the dataset is `tatsu-lab/alpaca`, and each job trains for 25 steps at LoRA rank 16. All of these are set in `serverConfig`.
+
+### Pass-fail assertions
+
+1. The model server is healthy
+2. The base model and both adapters are registered
+3. Inference succeeds against the base model
+4. Inference succeeds against the Kubeflow adapter
+5. Inference succeeds against the KubeRay adapter
+
+### Quantitative tests
+
+One chat request is sent to each of the base model, the Kubeflow adapter and the KubeRay adapter. Each must return a non-empty response. Completion tokens, latency in seconds and throughput in tokens per second are reported per model via Ginkgo `AddReportEntry`.
+
+### Prerequisites
+
+The Kubeflow Training Operator and KubeRay must be installed, with the `kubeflow.org` and `ray.io` API groups available, and the namespace needs permission to create PyTorchJobs and RayJobs. The models PVC must contain the base model. The training pods install their Python dependencies with pip when they start and load the dataset from Hugging Face, so they need outbound access to both.
+
+### Design rationale
+
+Both operators train the same model on the same data, and the quantitative step records tokens, latency and throughput for each so the frameworks can be compared.
+
+The scratchpad is how the steps hand data to each other: the DAG has no other way to pass the adapters from the training steps to the serving step.
+
+The training jobs use stock framework images, with the training script embedded in the job and the dependencies installed when it starts.
+
+The test supports project scope only.

@@ -1,0 +1,164 @@
+# Assisted by Claude Opus
+apiVersion: uat.openshift.io/v1
+kind: Test
+metadata:
+  name: iperf3-virt
+  version: v0.0.1
+  description: iperf3 TCP bandwidth between a pod and a KubeVirt VM on the same node
+  supportedScopes:
+    - node
+spec:
+  source:
+    ginkgo: iperf3-virt.go
+
+  serverConfig:
+    vmImage: quay.io/containerdisks/fedora:latest
+    readyTimeoutSeconds: "480"
+
+  dag:
+    - name: server-vm
+      resourceConfig:
+        apiVersion: kubevirt.io/v1
+        kind: VirtualMachine
+        spec:
+          runStrategy: Always
+          template:
+            metadata:
+              labels:
+                app: iperf3-virt-server
+                node: '{{ node }}'
+            spec:
+              nodeSelector:
+                kubernetes.io/hostname: '{{ node }}'
+              tolerations:
+                - key: nvidia.com/gpu.product
+                  operator: Exists
+                  effect: NoSchedule
+              terminationGracePeriodSeconds: 0
+              domain:
+                cpu:
+                  cores: 16
+                memory:
+                  guest: 32Gi
+                resources:
+                  requests:
+                    cpu: 16
+                    memory: 32Gi
+                  limits:
+                    cpu: 16
+                    memory: 32Gi
+                devices:
+                  networkInterfaceMultiqueue: true
+                  rng: {}
+                  disks:
+                    - name: rootdisk
+                      disk:
+                        bus: virtio
+                    - name: cloudinit
+                      disk:
+                        bus: virtio
+                  interfaces:
+                    - name: default
+                      model: virtio
+                      masquerade: {}
+              networks:
+                - name: default
+                  pod: {}
+              volumes:
+                - name: rootdisk
+                  containerDisk:
+                    image: '{{ serverConfig.vmImage }}'
+                - name: cloudinit
+                  cloudInitNoCloud:
+                    userData: |
+                      #cloud-config
+                      packages:
+                        - iperf3
+                      runcmd:
+                        - [iperf3, --server, --daemon]
+
+    - name: server-svc
+      resourceConfig:
+        apiVersion: v1
+        kind: Service
+        spec:
+          clusterIP: None
+          selector:
+            app: iperf3-virt-server
+            node: '{{ node }}'
+          ports:
+            - port: 5201
+              targetPort: 5201
+
+    - name: iperf-client
+      image: docker.io/networkstatic/iperf3:latest
+      labelFilter: pass-fail
+      resources:
+        requests:
+          cpu: 16
+          memory: 32Gi
+        limits:
+          cpu: 16
+          memory: 32Gi
+      env:
+        - name: SERVER_HOST
+          value: '{{ resource_name }}'
+        - name: READY_TIMEOUT_SECONDS
+          value: '{{ serverConfig.readyTimeoutSeconds }}'
+        - name: SWEEP_COMMAND
+          value: '{{ paramSweep.command | toJson }}'
+      parameterSweep:
+        baseCommand:
+          args:
+            - iperf3
+          flags:
+            client: '{{ resource_name }}'
+            time: 10
+            omit: 2
+            json: ~
+        entries:
+          - id: streams-1
+            description: pod to VM, 1 parallel stream
+            flags:
+              parallel: 1
+          - id: streams-2
+            description: pod to VM, 2 parallel streams
+            flags:
+              parallel: 2
+          - id: streams-4
+            description: pod to VM, 4 parallel streams
+            flags:
+              parallel: 4
+          - id: streams-8
+            description: pod to VM, 8 parallel streams
+            flags:
+              parallel: 8
+          - id: streams-16
+            description: pod to VM, 16 parallel streams
+            flags:
+              parallel: 16
+          - id: reverse-1
+            description: VM to pod, 1 parallel stream
+            flags:
+              parallel: 1
+              reverse: ~
+          - id: reverse-2
+            description: VM to pod, 2 parallel streams
+            flags:
+              parallel: 2
+              reverse: ~
+          - id: reverse-4
+            description: VM to pod, 4 parallel streams
+            flags:
+              parallel: 4
+              reverse: ~
+          - id: reverse-8
+            description: VM to pod, 8 parallel streams
+            flags:
+              parallel: 8
+              reverse: ~
+          - id: reverse-16
+            description: VM to pod, 16 parallel streams
+            flags:
+              parallel: 16
+              reverse: ~
