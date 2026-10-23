@@ -13,16 +13,10 @@
   vars:
     uat_mode: node
 
-- name: iperf3-virt
-  ansible.builtin.import_playbook: ../iperf3-virt.yml
-
 - name: fio
   ansible.builtin.import_playbook: ../fio.yml
   vars:
     uat_mode: serial
-
-- name: fio-virt
-  ansible.builtin.import_playbook: ../fio-virt.yml
 
 - name: dev-env
   ansible.builtin.import_playbook: ../dev-env.yml

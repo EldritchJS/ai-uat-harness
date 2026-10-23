@@ -1,0 +1,58 @@
+# Assisted by Claude Opus
+- name: Plan platform-check-virt
+  ansible.builtin.import_playbook: ../plugins/playbooks/sequences.yml
+  vars:
+    uat_test: platform-check-virt
+    uat_modes: [project, node, serial]
+
+- name: platform-check-virt
+  hosts: "{{ hostvars.localhost.uat_hosts | default('uat_none') }}"
+  serial: "{{ hostvars.localhost.uat_serial | default(0) }}"
+  gather_facts: false
+  vars:
+    serverConfig:
+      checks:
+        - {type: permission, verb: get, resource: pods, expected: "no"}
+        - {type: permission, verb: create, resource: pods, expected: "no"}
+        - {type: permission, verb: get, resource: secrets, expected: "no"}
+        - {type: permission, verb: get, resource: nodes, expected: "no"}
+        - {type: permission, verb: create, group: kubevirt.io, resource: virtualmachines, expected: "no"}
+        - {type: apiGroup, group: kubevirt.io, expected: "yes"}
+        - {type: apiGroup, group: subresources.kubevirt.io, expected: "yes"}
+        - {type: apiGroup, group: cdi.kubevirt.io, expected: "yes"}
+        - {type: apiGroup, group: nonexistent.example.io, expected: "no"}
+        - {type: crd, apiVersion: hco.kubevirt.io/v1beta1, kind: HyperConverged, expected: "yes"}
+        - {type: crd, apiVersion: kubevirt.io/v1, kind: KubeVirt, expected: "yes"}
+        - {type: crd, apiVersion: kubevirt.io/v1, kind: VirtualMachine, expected: "yes"}
+        - {type: crd, apiVersion: kubevirt.io/v1, kind: VirtualMachineInstance, expected: "yes"}
+        - {type: crd, apiVersion: cdi.kubevirt.io/v1beta1, kind: CDI, expected: "yes"}
+        - {type: crd, apiVersion: cdi.kubevirt.io/v1beta1, kind: DataVolume, expected: "yes"}
+        - {type: crd, apiVersion: networkaddonsoperator.network.kubevirt.io/v1, kind: NetworkAddonsConfig, expected: "yes"}
+  tasks:
+    - name: Start the sequence
+      ansible.builtin.import_role:
+        name: uat_sequence
+
+    - name: Steps
+      block:
+        - name: checker
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: checker
+              image: registry.redhat.io/ubi9/ubi:9.8
+              labelFilter: pass-fail
+              env:
+                - name: PERMISSION_CHECKS
+                  value: "{{ serverConfig.checks | to_json }}"
+      rescue:
+        - name: Handle the failure
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: failed
+      always:
+        - name: Tear down
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: teardown
