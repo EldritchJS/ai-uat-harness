@@ -1,0 +1,15 @@
+# Assisted by Claude Opus
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ _uat_name }}
+  namespace: {{ namespace }}
+  labels: {{ _uat_pod_labels | to_json }}
+spec:
+{% if step.service.headless | default(false) | bool %}
+  clusterIP: None
+{% endif %}
+  selector: {{ _uat_selector | to_json }}
+  ports:
+    - port: {{ step.service.port | int }}
+      targetPort: {{ step.service.port | int }}

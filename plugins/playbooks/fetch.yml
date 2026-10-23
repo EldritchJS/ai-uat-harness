@@ -1,0 +1,9 @@
+# Assisted by Claude Opus
+- name: Copy a runner-pod run back
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Fetch
+      ansible.builtin.import_role:
+        name: uat_runner
+        tasks_from: fetch

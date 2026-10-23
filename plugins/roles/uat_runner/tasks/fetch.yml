@@ -1,0 +1,117 @@
+# Assisted by Claude Opus
+- name: Name the fetch pod
+  ansible.builtin.set_fact:
+    _uat_fetch_pod: "uat-fetch-{{ uat_run_id | lower | regex_replace('[^a-z0-9]+', '-') }}"
+    _uat_runner_pod: "uat-runner-{{ uat_run_id | lower | regex_replace('[^a-z0-9]+', '-') }}"
+    _uat_run_dir: "{{ uat_runs_dir }}/{{ uat_run_id }}"
+
+- name: Look for the runner pod
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: "{{ uat_runner.namespace }}"
+    name: "{{ _uat_runner_pod }}"
+  register: _uat_runner_now
+
+- name: Stop if the runner is still going
+  ansible.builtin.assert:
+    that: >-
+      _uat_runner_now.resources | length == 0
+      or (_uat_runner_now.resources | first).status.phase | default('') in ['Succeeded', 'Failed']
+    fail_msg: "Run {{ uat_run_id }} is still running; follow it with: oc logs -f {{ _uat_runner_pod }} -n {{ uat_runner.namespace }}"
+    quiet: true
+
+- name: Copy the run back from the runner PVC
+  block:
+    - name: Start the fetch pod
+      kubernetes.core.k8s:
+        state: present
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: "{{ uat_deploy_timeout }}"
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "{{ _uat_fetch_pod }}"
+            namespace: "{{ uat_runner.namespace }}"
+            labels:
+              app.kubernetes.io/managed-by: "{{ uat_managed_by }}"
+              uat/run: "{{ uat_run_id }}"
+          spec:
+            restartPolicy: Never
+            terminationGracePeriodSeconds: 0
+            containers:
+              - name: fetch
+                image: "{{ uat_collector_image }}"
+                command: [sleep, infinity]
+                volumeMounts:
+                  - {name: workspace, mountPath: /uat_workspace}
+            volumes:
+              - name: workspace
+                persistentVolumeClaim:
+                  claimName: "{{ uat_runner.pvc }}"
+
+    - name: Pack the run
+      kubernetes.core.k8s_exec:
+        namespace: "{{ uat_runner.namespace }}"
+        pod: "{{ _uat_fetch_pod }}"
+        command: sh -c "tar czf /tmp/run.tgz -C /uat_workspace/runs/{{ uat_run_id }} ."
+
+    - name: Make the local run directory
+      ansible.builtin.file:
+        path: "{{ _uat_run_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Copy the run here
+      kubernetes.core.k8s_cp:
+        namespace: "{{ uat_runner.namespace }}"
+        pod: "{{ _uat_fetch_pod }}"
+        state: from_pod
+        remote_path: /tmp/run.tgz
+        local_path: "{{ _uat_run_dir }}/run.tgz"
+
+    - name: Unpack the run
+      ansible.builtin.unarchive:
+        src: "{{ _uat_run_dir }}/run.tgz"
+        dest: "{{ _uat_run_dir }}"
+        remote_src: true
+
+    - name: Remove the package
+      ansible.builtin.file:
+        path: "{{ _uat_run_dir }}/run.tgz"
+        state: absent
+
+    - name: Save the runner log and delete the runner pod
+      when: _uat_runner_now.resources | length > 0
+      block:
+        - name: Read the runner log
+          kubernetes.core.k8s_log:
+            namespace: "{{ uat_runner.namespace }}"
+            name: "{{ _uat_runner_pod }}"
+          register: _uat_runner_log
+
+        - name: Save the runner log
+          ansible.builtin.copy:
+            dest: "{{ _uat_run_dir }}/runner.log"
+            mode: "0644"
+            content: "{{ _uat_runner_log.log }}"
+
+        - name: Delete the runner pod
+          kubernetes.core.k8s:
+            state: absent
+            kind: Pod
+            namespace: "{{ uat_runner.namespace }}"
+            name: "{{ _uat_runner_pod }}"
+            wait: true
+  always:
+    - name: Delete the fetch pod
+      kubernetes.core.k8s:
+        state: absent
+        kind: Pod
+        namespace: "{{ uat_runner.namespace }}"
+        name: "{{ _uat_fetch_pod }}"
+        wait: true
+      failed_when: false

@@ -1,0 +1,68 @@
+# Assisted by Claude Opus
+- name: "Note that the builder in {{ uat_store.namespace }} is starting"
+  ansible.builtin.set_fact:
+    _uat_builder_starting: true
+
+- name: "Delete the old builder in {{ uat_store.namespace }}"
+  kubernetes.core.k8s:
+    state: absent
+    kind: Pod
+    namespace: "{{ uat_store.namespace }}"
+    name: "{{ _uat_builder }}"
+    wait: true
+    wait_timeout: "{{ uat_delete_timeout }}"
+  when: _uat_builder_pod.resources | length > 0
+
+- name: "Start the builder pod in {{ uat_store.namespace }}"
+  kubernetes.core.k8s:
+    state: present
+    wait: true
+    wait_condition:
+      type: Ready
+      status: "True"
+    wait_timeout: "{{ uat_deploy_timeout }}"
+    definition:
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: "{{ _uat_builder }}"
+        namespace: "{{ uat_store.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: "{{ uat_managed_by }}"
+          uat/run: "{{ uat_run_id }}"
+      spec:
+        restartPolicy: Never
+        terminationGracePeriodSeconds: 0
+        tolerations: "{{ uat_tolerations }}"
+        containers:
+          - name: builder
+            image: "{{ uat_builder_image }}"
+            command: [sleep, infinity]
+            volumeMounts:
+              - name: workspace
+                mountPath: /uat_workspace
+              - name: src
+                mountPath: /src
+        volumes:
+          - name: workspace
+            persistentVolumeClaim:
+              claimName: "{{ uat_store.pvc }}"
+          - name: src
+            emptyDir: {}
+
+- name: "Copy the compile script and cluster spec into the builder in {{ uat_store.namespace }}"
+  kubernetes.core.k8s_cp:
+    namespace: "{{ uat_store.namespace }}"
+    pod: "{{ _uat_builder }}"
+    state: to_pod
+    content: "{{ item.content }}"
+    remote_path: "/src/{{ item.name }}"
+  loop:
+    - {name: compile.sh, content: "{{ lookup('ansible.builtin.file', 'compile.sh') }}"}
+    - {name: cluster.yaml, content: "{{ uat_cluster_spec }}"}
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: "Note that the builder in {{ uat_store.namespace }} is running"
+  ansible.builtin.set_fact:
+    _uat_builder_starting: false

@@ -1,0 +1,31 @@
+# Assisted by Claude Opus
+- name: Build the test binaries
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Set up the build record
+      ansible.builtin.import_role:
+        name: uat_run
+        tasks_from: context
+
+    - name: Prepare the builds
+      ansible.builtin.import_role:
+        name: uat_build
+
+    - name: Build every test
+      ansible.builtin.include_role:
+        name: uat_build
+        tasks_from: test
+      loop: "{{ uat_go_places | dict2items | selectattr('value') | map(attribute='key') | list }}"
+      loop_control:
+        loop_var: uat_test
+
+    - name: Delete the builders
+      ansible.builtin.import_role:
+        name: uat_build
+        tasks_from: stop
+
+    - name: Fail when a test did not build
+      ansible.builtin.fail:
+        msg: "Not built: {{ uat_build_failures | join(', ') }}. See {{ uat_run_dir }}/logs/"
+      when: uat_build_failures | length > 0

@@ -1,0 +1,119 @@
+# Assisted by Claude Opus
+- name: Plan guidellm
+  ansible.builtin.import_playbook: ../plugins/playbooks/sequences.yml
+  vars:
+    uat_test: guidellm
+    uat_modes: [node, serial, project]
+    uat_on_failure: abort
+    uat_timeout: 1200
+
+- name: guidellm
+  hosts: "{{ hostvars.localhost.uat_hosts | default('uat_none') }}"
+  serial: "{{ hostvars.localhost.uat_serial | default(0) }}"
+  gather_facts: false
+  tasks:
+    - name: Start the sequence
+      ansible.builtin.import_role:
+        name: uat_sequence
+
+    - name: Steps
+      block:
+        - name: vllm-server
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: vllm-server
+              image: nvcr.io/nvidia/vllm:26.03-py3
+              service:
+                enabled: true
+                port: 8000
+                name: vllm-server
+                headless: true
+              command:
+                args: [python, -m, vllm.entrypoints.openai.api_server]
+                flags:
+                  model: /models/ibm-granite/granite-3.3-8b-instruct
+                  port: 8000
+                  max-model-len: 10000
+                  gpu-memory-utilization: 0.6
+              env:
+                - name: HOME
+                  value: /tmp
+              ports:
+                - {containerPort: 8000, name: http}
+              readinessProbe:
+                httpGet: {path: /health, port: 8000}
+                initialDelaySeconds: 30
+                periodSeconds: 10
+                timeoutSeconds: 5
+                failureThreshold: 30
+              resources:
+                requests: {nvidia.com/gpu: "1"}
+                limits: {nvidia.com/gpu: "1"}
+              persistsThroughSweep: true
+
+        - name: pass-fail
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: pass-fail
+              image: ghcr.io/vllm-project/guidellm:v0.6.1
+              labelFilter: pass-fail
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: SERVER_URL
+                  value: '{{ services["vllm-server"].url }}'
+
+        - name: sweep
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: sweep
+              image: ghcr.io/vllm-project/guidellm:v0.6.1
+              labelFilter: quantitative
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: SERVER_URL
+                  value: '{{ services["vllm-server"].url }}'
+                - name: SWEEP_COMMAND
+                  value: "{{ paramSweep.command | to_json }}"
+              parameterSweep:
+                baseCommand:
+                  args: [guidellm, benchmark, run]
+                  flags:
+                    target: '{{ services["vllm-server"].url }}'
+                    output-dir: /uat_workspace
+                    outputs: json
+                    rate-type: throughput
+                    max-seconds: 120
+                    rate: 1
+                    data: prompt_tokens=256,output_tokens=128
+                entries:
+                  - id: short-burst
+                    description: Short high-rate burst benchmark
+                    flags:
+                      max-seconds: 30
+                      rate: 4
+                      data: prompt_tokens=128,output_tokens=64
+                  - id: sustained-load
+                    description: Sustained moderate-rate benchmark
+                  - id: long-context
+                    description: Long context window benchmark
+                    flags:
+                      max-seconds: 60
+                      data: prompt_tokens=1024,output_tokens=512
+      rescue:
+        - name: Handle the failure
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: failed
+      always:
+        - name: Tear down
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: teardown

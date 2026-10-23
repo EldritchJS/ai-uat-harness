@@ -1,0 +1,12 @@
+# Assisted by Claude Opus
+- name: platform-check
+  ansible.builtin.import_playbook: ../platform-check.yml
+
+- name: iperf3
+  ansible.builtin.import_playbook: ../iperf3.yml
+
+- name: ping
+  ansible.builtin.import_playbook: ../ping.yml
+
+- name: Finish
+  ansible.builtin.import_playbook: ../../plugins/playbooks/finish.yml

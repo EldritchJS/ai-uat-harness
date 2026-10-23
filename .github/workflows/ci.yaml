@@ -19,15 +19,12 @@ jobs:
         with:
           args: format --check
 
-  test:
+  syntax:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
-      - run: pip install -r requirements.txt pytest
-      - run: pytest tests/ -v
+          python-version: "3.12"
+      - run: pip install "ansible-core~=2.18.0" "kubernetes~=34.1"
+      - run: ./build.sh

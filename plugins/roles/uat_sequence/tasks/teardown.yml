@@ -1,0 +1,55 @@
+# Assisted by Claude Opus
+- name: "Prepare teardown of sequence {{ uat_seq.qid }}"
+  ansible.builtin.set_fact:
+    _uat_t0: "{{ now().timestamp() }}"
+    _uat_started: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+
+- name: "Delete the objects of sequence {{ uat_seq.qid }}"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: "{{ item.api_version }}"
+    kind: "{{ item.kind }}"
+    namespace: "{{ item.namespace }}"
+    label_selectors:
+      - "{{ uat_seq_labels | uat_selector }}"
+    delete_all: true
+    wait: true
+    wait_timeout: "{{ uat_delete_timeout }}"
+  loop: "{{ uat_seq_objects | unique }}"
+  loop_control:
+    label: "{{ item.namespace }} {{ item.kind }}"
+  register: _uat_teardown
+  failed_when: false
+  when: not uat_dry_run | bool
+
+- name: "Note teardown errors of sequence {{ uat_seq.qid }}"
+  ansible.builtin.set_fact:
+    _uat_teardown_errors: >-
+      {{ _uat_teardown.results | default([]) | selectattr('msg', 'defined')
+         | map(attribute='msg') | list | join('; ') }}
+
+- name: "Record teardown of sequence {{ uat_seq.qid }}"
+  ansible.builtin.copy:
+    dest: "{{ uat_run_dir }}/steps/{{ uat_step_prefix }}-teardown.json"
+    mode: "0644"
+    content: >-
+      {{ {
+           'run': uat_run_id,
+           'tid': uat_tid,
+           'test_id': uat_test_id | int,
+           'test': uat_test,
+           'mode': uat_seq_mode,
+           'sequence': uat_seq.qid,
+           'nodes': uat_seq.nodes,
+           'dir': uat_step_prefix ~ '-teardown',
+           'step': 'teardown',
+           'kind': 'Teardown',
+           'namespace': uat_seq_objects | map(attribute='namespace') | unique | join(' '),
+           'name': uat_seq_labels | uat_selector,
+           'status': 'error' if _uat_teardown_errors | length > 0 else 'done',
+           'reason': _uat_teardown_errors | truncate(500),
+           'started': _uat_started,
+           'finished': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ'),
+           'duration_s': ((now().timestamp() - (_uat_t0 | float)) | round(1)),
+           'sequence_status': 'failed' if uat_seq_failed | bool else 'completed'
+         } | to_nice_json }}

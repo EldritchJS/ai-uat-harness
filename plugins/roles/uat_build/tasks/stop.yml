@@ -1,0 +1,13 @@
+# Assisted by Claude Opus
+- name: Delete the builder pods
+  kubernetes.core.k8s:
+    state: absent
+    kind: Pod
+    namespace: "{{ item.namespace }}"
+    name: "uat-build-{{ uat_run_slug }}-{{ item.role }}"
+    wait: true
+    wait_timeout: "{{ uat_delete_timeout }}"
+  loop: "{{ uat_storages }}"
+  loop_control:
+    label: "{{ item.namespace }}"
+  failed_when: false

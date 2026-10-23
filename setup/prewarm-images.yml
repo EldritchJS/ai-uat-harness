@@ -1,0 +1,78 @@
+# Assisted by Claude Opus
+- name: Pull the test images onto every node
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - uat_config
+  vars:
+    uat_prewarm_timeout: 1200
+    uat_prewarm_label: app=image-prewarm
+  tasks:
+    - name: Find the images the tests use
+      ansible.builtin.set_fact:
+        _uat_images: >-
+          {{ uat_prewarm_images | default(
+               query('ansible.builtin.file', *query('ansible.builtin.fileglob', uat_tests_dir ~ '/*.yml'))
+               | uat_images) }}
+
+    - name: Show the plan
+      ansible.builtin.debug:
+        msg: "{{ groups['uat_nodes'] | length }} nodes x {{ _uat_images | length }} images in {{ uat_namespace }}: {{ _uat_images }}"
+
+    - name: Start a pod per node and image
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "prewarm-n{{ item.0.0 }}-i{{ item.1.0 }}"
+            namespace: "{{ uat_namespace }}"
+            labels:
+              app: image-prewarm
+              uat/node: "{{ item.0.1 }}"
+            annotations:
+              uat/image: "{{ item.1.1 }}"
+          spec:
+            restartPolicy: Never
+            nodeSelector: "{{ {uat_node_selector_key: item.0.1} }}"
+            tolerations: "{{ uat_tolerations }}"
+            containers:
+              - name: prewarm
+                image: "{{ item.1.1 }}"
+                command: ["true"]
+      loop: "{{ groups['uat_nodes'] | default([]) | uat_enumerate | product(_uat_images | uat_enumerate) | list }}"
+      loop_control:
+        label: "{{ item.0.1 }} {{ item.1.1 }}"
+
+    - name: Wait until every image has pulled or failed
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ uat_namespace }}"
+        label_selectors:
+          - "{{ uat_prewarm_label }}"
+      register: _uat_prewarm
+      until: _uat_prewarm.resources | uat_pulling | length == 0
+      retries: "{{ ((uat_prewarm_timeout | int) / 10) | round(0, 'ceil') | int }}"
+      delay: 10
+      failed_when: false
+
+    - name: Report the result
+      ansible.builtin.debug:
+        msg:
+          still_pulling: "{{ _uat_prewarm.resources | uat_pulling }}"
+          failed_to_pull: "{{ _uat_prewarm.resources | uat_pull_failed }}"
+
+    - name: Delete the prewarm pods
+      kubernetes.core.k8s:
+        state: absent
+        kind: Pod
+        namespace: "{{ uat_namespace }}"
+        label_selectors:
+          - "{{ uat_prewarm_label }}"
+        delete_all: true
+
+    - name: Fail when an image did not pull
+      ansible.builtin.fail:
+        msg: "Not cached: {{ (_uat_prewarm.resources | uat_pull_failed) + (_uat_prewarm.resources | uat_pulling) }}"
+      when: (_uat_prewarm.resources | uat_pull_failed) | length > 0 or (_uat_prewarm.resources | uat_pulling) | length > 0

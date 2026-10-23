@@ -1,0 +1,84 @@
+# Assisted by Claude Opus
+- name: Plan dev-env
+  ansible.builtin.import_playbook: ../plugins/playbooks/sequences.yml
+  vars:
+    uat_test: dev-env
+    uat_modes: [node, serial]
+    uat_timeout: 600
+
+- name: dev-env
+  hosts: "{{ hostvars.localhost.uat_hosts | default('uat_none') }}"
+  serial: "{{ hostvars.localhost.uat_serial | default(0) }}"
+  gather_facts: false
+  tasks:
+    - name: Start the sequence
+      ansible.builtin.import_role:
+        name: uat_sequence
+
+    - name: Steps
+      block:
+        - name: notebook-server
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: notebook-server
+              image: quay.io/jschless/ml-dev-env:pytorch-2.9
+              command:
+                args:
+                  - jupyter
+                  - lab
+                  - --notebook-dir=/uat_workspace
+                  - --ip=0.0.0.0
+                  - --port=8888
+                  - --no-browser
+                  - --IdentityProvider.token=
+                  - --ServerApp.disable_check_xsrf=True
+              env:
+                - name: HOME
+                  value: /tmp
+              service:
+                enabled: true
+                port: 8888
+                name: notebook-server
+                headless: true
+              ports:
+                - containerPort: 8888
+              readinessProbe:
+                httpGet: {path: /api/status, port: 8888}
+                initialDelaySeconds: 30
+                periodSeconds: 10
+                timeoutSeconds: 5
+                failureThreshold: 30
+              resources:
+                requests:
+                  nvidia.com/gpu: '{{ nodeSpec.componentValidation.sanity["nvidia.com/gpu"] }}'
+                limits:
+                  nvidia.com/gpu: '{{ nodeSpec.componentValidation.sanity["nvidia.com/gpu"] }}'
+              persistsThroughSweep: true
+
+        - name: validator
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: validator
+              image: registry.redhat.io/ubi9/ubi:9.8
+              labelFilter: pass-fail
+              env:
+                - name: SERVER_URL
+                  value: '{{ services["notebook-server"]["url"] }}'
+                - name: EXPECTED_GPU_COUNT
+                  value: '{{ nodeSpec.componentValidation.sanity["nvidia.com/gpu"] }}'
+                - name: EXPECTED_NVLINK
+                  value: "{{ nodeSpec.componentValidation.sanity.nvlink }}"
+      rescue:
+        - name: Handle the failure
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: failed
+      always:
+        - name: Tear down
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: teardown

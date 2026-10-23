@@ -1,0 +1,368 @@
+# Assisted by Claude Opus
+- name: Plan finetune-lora
+  ansible.builtin.import_playbook: ../plugins/playbooks/sequences.yml
+  vars:
+    uat_test: finetune-lora
+    uat_modes: [project]
+    uat_on_failure: skipTest
+    uat_timeout: 3600
+
+- name: finetune-lora
+  hosts: "{{ hostvars.localhost.uat_hosts | default('uat_none') }}"
+  serial: "{{ hostvars.localhost.uat_serial | default(0) }}"
+  gather_facts: false
+  vars:
+    serverConfig:
+      model: /models/Qwen/Qwen2.5-3B-Instruct
+      modelsPVC: "{{ uat_storage.models.pvc }}"
+      trainImage: docker.io/pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+      trainRuntime: torch-distributed
+      baseModelName: qwen-base
+      kubeflowAdapter: kubeflow
+      dataset: tatsu-lab/alpaca
+      maxSteps: "25"
+      loraRank: "16"
+      gpuCount: "2"
+      prompt: "Give three tips for staying healthy."
+
+    finetune_train_kubeflow:
+      name: train-kubeflow
+      resourceConfig:
+        apiVersion: trainer.kubeflow.org/v1alpha1
+        kind: TrainJob
+        spec:
+          runtimeRef:
+            name: '{{ serverConfig.trainRuntime }}'
+          trainer:
+            image: '{{ serverConfig.trainImage }}'
+            numNodes: 1
+            numProcPerNode: gpu
+            env:
+              - name: MODEL_PATH
+                value: '{{ serverConfig.model }}'
+              - name: DATASET
+                value: '{{ serverConfig.dataset }}'
+              - name: OUTPUT_DIR
+                value: '{{ scratchpad.mountPath }}/{{ serverConfig.kubeflowAdapter }}'
+              - name: MAX_STEPS
+                value: '{{ serverConfig.maxSteps }}'
+              - name: LORA_RANK
+                value: '{{ serverConfig.loraRank }}'
+              - name: HOME
+                value: /tmp
+              - name: HF_HOME
+                value: /tmp/hf
+              - name: NCCL_DEBUG
+                value: WARN
+            command:
+              - bash
+              - -c
+              - |
+                set -euo pipefail
+                export PYTHONUSERBASE=/tmp/pip-user
+                export PATH="$PYTHONUSERBASE/bin:$PATH"
+                pip install --no-cache-dir --user \
+                  "transformers==4.46.3" "datasets==2.21.0" \
+                  "accelerate==1.1.1" "peft==0.13.2" "trl==0.12.1" \
+                  sentencepiece protobuf
+                cat > /tmp/fine-tune.py <<'PYEOF'
+                import math
+                import os
+
+                import torch
+                from datasets import load_dataset
+                from transformers import (
+                    AutoModelForCausalLM,
+                    AutoTokenizer,
+                    TrainingArguments,
+                )
+                from peft import LoraConfig
+                from trl import SFTTrainer
+
+                MODEL_PATH = os.environ["MODEL_PATH"]
+                DATASET = os.environ["DATASET"]
+                OUTPUT_DIR = os.environ["OUTPUT_DIR"]
+                MAX_STEPS = int(os.environ.get("MAX_STEPS", "25"))
+                EVAL_SAMPLES = int(os.environ.get("EVAL_SAMPLES", "200"))
+                LEARNING_RATE = float(os.environ.get("LEARNING_RATE", "2e-4"))
+                BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
+                LORA_RANK = int(os.environ.get("LORA_RANK", "16"))
+                MAX_SEQ_LENGTH = int(os.environ.get("MAX_SEQ_LENGTH", "2048"))
+
+                LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
+                is_main = LOCAL_RANK == 0
+
+                def log(*a):
+                    if is_main:
+                        print(*a, flush=True)
+
+                if is_main:
+                    n = torch.cuda.device_count()
+                    names = ", ".join(torch.cuda.get_device_name(i) for i in range(n))
+                    log(f"[setup] world_size={os.environ.get('WORLD_SIZE')} gpus={n} ({names})")
+
+                tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+                if tokenizer.pad_token is None:
+                    tokenizer.pad_token = tokenizer.eos_token
+
+                dataset = load_dataset(DATASET, split="train")
+
+                def format_instruction(example):
+                    instr = example.get("instruction", "")
+                    if example.get("input"):
+                        instr += "\n" + example["input"]
+                    messages = [
+                        {"role": "user", "content": instr},
+                        {"role": "assistant", "content": example.get("output", "")},
+                    ]
+                    return {"text": tokenizer.apply_chat_template(messages, tokenize=False)}
+
+                dataset = dataset.map(format_instruction, remove_columns=list(dataset.features))
+                split = dataset.train_test_split(test_size=EVAL_SAMPLES, seed=42)
+                train_ds, eval_ds = split["train"], split["test"]
+                log(f"[data] train={len(train_ds)} eval={len(eval_ds)} from {DATASET}")
+
+                log(f"[model] loading {MODEL_PATH}")
+                model = AutoModelForCausalLM.from_pretrained(
+                    MODEL_PATH, torch_dtype=torch.bfloat16, trust_remote_code=True
+                )
+                model.config.use_cache = False
+
+                lora_config = LoraConfig(
+                    r=LORA_RANK,
+                    lora_alpha=LORA_RANK * 2,
+                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                                    "gate_proj", "up_proj", "down_proj"],
+                    lora_dropout=0.05,
+                    bias="none",
+                    task_type="CAUSAL_LM",
+                )
+
+                training_args = TrainingArguments(
+                    output_dir="/tmp/sft-checkpoints",
+                    max_steps=MAX_STEPS,
+                    per_device_train_batch_size=BATCH_SIZE,
+                    per_device_eval_batch_size=BATCH_SIZE,
+                    gradient_accumulation_steps=1,
+                    learning_rate=LEARNING_RATE,
+                    warmup_ratio=0.03,
+                    lr_scheduler_type="cosine",
+                    logging_steps=10,
+                    eval_strategy="steps",
+                    eval_steps=max(1, MAX_STEPS // 2),
+                    save_strategy="no",
+                    bf16=True,
+                    gradient_checkpointing=True,
+                    gradient_checkpointing_kwargs={"use_reentrant": False},
+                    ddp_find_unused_parameters=False,
+                    disable_tqdm=True,
+                    report_to="none",
+                )
+
+                trainer = SFTTrainer(
+                    model=model,
+                    args=training_args,
+                    train_dataset=train_ds,
+                    eval_dataset=eval_ds,
+                    peft_config=lora_config,
+                    max_seq_length=MAX_SEQ_LENGTH,
+                    tokenizer=tokenizer,
+                    dataset_text_field="text",
+                    packing=True,
+                )
+                if is_main:
+                    trainer.model.print_trainable_parameters()
+
+                log("[train] starting...")
+                train_result = trainer.train()
+                eval_loss = trainer.evaluate()["eval_loss"]
+                log(f"[result] train_loss={train_result.metrics.get('train_loss'):.4f} "
+                    f"eval_loss={eval_loss:.4f} perplexity={math.exp(eval_loss):.2f}")
+
+                log(f"[save] writing LoRA adapter to {OUTPUT_DIR}")
+                trainer.save_model(OUTPUT_DIR)
+                if trainer.is_world_process_zero():
+                    tokenizer.save_pretrained(OUTPUT_DIR)
+                    print("=== kubeflow fine-tune complete:", OUTPUT_DIR, "===", flush=True)
+                PYEOF
+                torchrun /tmp/fine-tune.py
+            resourcesPerNode:
+              requests:
+                cpu: "8"
+                memory: 48Gi
+                nvidia.com/gpu: '{{ serverConfig.gpuCount }}'
+              limits:
+                nvidia.com/gpu: '{{ serverConfig.gpuCount }}'
+          podTemplateOverrides:
+            - targetJobs:
+                - name: node
+              metadata:
+                labels:
+                  app.kubernetes.io/managed-by: '{{ uat_managed_by }}'
+              spec:
+                tolerations:
+                  - key: nvidia.com/gpu.product
+                    operator: Exists
+                    effect: NoSchedule
+                containers:
+                  - name: node
+                    volumeMounts:
+                      - name: models
+                        mountPath: /models
+                        readOnly: true
+                      - name: scratchpad
+                        mountPath: '{{ scratchpad.mountPath }}'
+                        subPath: '{{ scratchpad.subPath }}'
+                      - name: shm
+                        mountPath: /dev/shm
+                volumes:
+                  - name: models
+                    persistentVolumeClaim:
+                      claimName: '{{ serverConfig.modelsPVC }}'
+                  - name: scratchpad
+                    persistentVolumeClaim:
+                      claimName: '{{ scratchpad.pvc }}'
+                  - name: shm
+                    emptyDir:
+                      medium: Memory
+                      sizeLimit: 16Gi
+
+    finetune_wait_adapters:
+      name: wait-adapters
+      image: registry.redhat.io/ubi9/ubi:9.8
+      env:
+        - name: KUBEFLOW_ADAPTER
+          value: '/uat_scratchpad/{{ serverConfig.kubeflowAdapter }}/adapter_config.json'
+      command:
+        args:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            deadline=$(( $(date +%s) + 3300 ))
+            echo "--- waiting for $KUBEFLOW_ADAPTER ---"
+            until [ -f "$KUBEFLOW_ADAPTER" ]; do
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "timed out waiting for $KUBEFLOW_ADAPTER" >&2
+                exit 1
+              fi
+              sleep 15
+            done
+            echo "=== adapter present on the scratchpad ==="
+            ls -la /uat_scratchpad/*/
+
+    finetune_vllm_server:
+      name: vllm-server
+      image: docker.io/vllm/vllm-openai:v0.6.6
+      service:
+        enabled: true
+        port: 8080
+        name: vllm-server
+        headless: true
+      command:
+        args:
+          - python3
+          - -m
+          - vllm.entrypoints.openai.api_server
+          - '--model={{ serverConfig.model }}'
+          - '--served-model-name={{ serverConfig.baseModelName }}'
+          - --port=8080
+          - --max-model-len=8192
+          - --gpu-memory-utilization=0.90
+          - --enable-lora
+          - '--max-lora-rank={{ serverConfig.loraRank }}'
+          - --max-loras=1
+          - '--lora-modules={{ serverConfig.kubeflowAdapter }}=/uat_scratchpad/{{ serverConfig.kubeflowAdapter }}'
+      env:
+        - name: HOME
+          value: /tmp
+      ports:
+        - containerPort: 8080
+          name: http
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        initialDelaySeconds: 30
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 60
+      resources:
+        requests:
+          nvidia.com/gpu: "1"
+        limits:
+          nvidia.com/gpu: "1"
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+      volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+      persistsThroughSweep: true
+
+    finetune_query_env:
+      - name: SERVER_URL
+        value: '{{ services["vllm-server"]["url"] }}'
+      - name: BASE_MODEL
+        value: '{{ serverConfig.baseModelName }}'
+      - name: KUBEFLOW_MODEL
+        value: '{{ serverConfig.kubeflowAdapter }}'
+      - name: PROMPT
+        value: '{{ serverConfig.prompt }}'
+
+  tasks:
+    - name: Start the sequence
+      ansible.builtin.import_role:
+        name: uat_sequence
+
+    - name: Steps
+      block:
+        - name: train-kubeflow
+          ansible.builtin.include_role:
+            name: uat_resource
+          vars:
+            step: "{{ finetune_train_kubeflow }}"
+
+        - name: wait-adapters
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step: "{{ finetune_wait_adapters }}"
+
+        - name: vllm-server
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step: "{{ finetune_vllm_server }}"
+
+        - name: query
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: query
+              image: registry.redhat.io/ubi9/ubi:9.8
+              labelFilter: pass-fail
+              env: "{{ finetune_query_env }}"
+
+        - name: query-quant
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: query-quant
+              image: registry.redhat.io/ubi9/ubi:9.8
+              labelFilter: quantitative
+              env: "{{ finetune_query_env }}"
+      rescue:
+        - name: Handle the failure
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: failed
+      always:
+        - name: Tear down
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: teardown

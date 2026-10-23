@@ -1,11 +1,10 @@
-build/
+collections/
+runs/
+decisions.md
 __pycache__/
 *.pyc
 .ruff_cache/
-.pytest_cache/
-.coverage
 .claude/
-cluster/*.local.yaml
 temp/
 TODO.md
 .env

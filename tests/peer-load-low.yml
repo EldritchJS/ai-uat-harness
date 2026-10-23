@@ -1,0 +1,6 @@
+# Assisted by Claude Opus
+- name: peer-load-low
+  ansible.builtin.import_playbook: peer-load-high.yml
+  vars:
+    uat_test: peer-load-low
+    peer_load_rate: 1

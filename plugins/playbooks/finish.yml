@@ -1,0 +1,9 @@
+# Assisted by Claude Opus
+- name: Finish the run
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Finish
+      ansible.builtin.import_role:
+        name: uat_run
+        tasks_from: finish

@@ -1,0 +1,196 @@
+# Assisted by Claude Opus
+{% set sizes = {'results': '50Gi', 'models': '100Gi', 'runner': '100Gi'} | combine(uat_setup.sizes | default({})) %}
+{% set test_namespaces = [uat_namespace] + ([uat_peer_namespace] if uat_peer_namespace | default('') else []) %}
+{% set runner_ns = uat_runner.namespace | default('') if uat_runner is defined else '' %}
+{% set all_namespaces = test_namespaces + ([runner_ns] if runner_ns else []) %}
+{% for ns in all_namespaces %}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ ns }}
+  labels:
+    massopen.cloud/project: {{ ns | to_json }}
+    opendatahub.io/dashboard: "true"
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace-and-internet
+  namespace: {{ ns }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {}
+  egress:
+    - to:
+        - podSelector: {}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+{% endfor %}
+{% set claims = [
+     {'namespace': uat_namespace, 'name': uat_storage.pvc, 'size': sizes.results},
+     {'namespace': uat_namespace, 'name': uat_storage.models.pvc | default(''), 'size': sizes.models}]
+   + (uat_setup.vmDisks | default([{'name': 'uat-project-storage-virt', 'size': sizes.results},
+                                   {'name': 'uat-models-virt', 'size': sizes.models}])
+      | map('combine', {'namespace': uat_namespace}) | list)
+   + ([{'namespace': uat_peer_namespace, 'name': uat_peer_storage.pvc, 'size': sizes.results},
+       {'namespace': uat_peer_namespace, 'name': uat_peer_storage.models.pvc | default(''), 'size': sizes.models}]
+      if uat_peer_namespace | default('') else [])
+   + ([{'namespace': runner_ns, 'name': uat_runner.pvc, 'size': sizes.runner}] if runner_ns else []) %}
+{% for c in claims if c.name %}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ c.name }}
+  namespace: {{ c.namespace }}
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: {{ uat_setup.storageClass | to_json }}
+  resources:
+    requests:
+      storage: {{ c.size }}
+{% endfor %}
+{% for ns in test_namespaces %}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: uat-user-role
+  namespace: {{ ns }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+{% if ns == uat_namespace %}
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["jobset.x-k8s.io"]
+    resources: ["jobsets"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: ["kubeflow.org"]
+    resources: ["pytorchjobs", "tfjobs", "mpijobs", "xgboostjobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: ["trainer.kubeflow.org"]
+    resources: ["trainjobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: ["serving.kserve.io"]
+    resources: ["inferenceservices", "servingruntimes"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: ["ray.io"]
+    resources: ["rayjobs", "rayclusters", "rayservices"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines", "virtualmachineinstances"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+{% endif %}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: uat-user-binding
+  namespace: {{ ns }}
+subjects: {{ _uat_subjects | to_json }}
+roleRef:
+  kind: Role
+  name: uat-user-role
+  apiGroup: rbac.authorization.k8s.io
+{% if runner_ns %}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: uat-runner-sa-{{ 'project' if ns == uat_namespace else 'peer' }}-binding
+  namespace: {{ ns }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ uat_runner.serviceAccount }}
+    namespace: {{ runner_ns }}
+roleRef:
+  kind: Role
+  name: uat-user-role
+  apiGroup: rbac.authorization.k8s.io
+{% endif %}
+{% endfor %}
+{% if runner_ns %}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ uat_runner.serviceAccount }}
+  namespace: {{ runner_ns }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: uat-runner-role
+  namespace: {{ runner_ns }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: uat-runner-sa-self-binding
+  namespace: {{ runner_ns }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ uat_runner.serviceAccount }}
+    namespace: {{ runner_ns }}
+roleRef:
+  kind: Role
+  name: uat-runner-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: uat-runner-user-role
+  namespace: {{ runner_ns }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: uat-runner-user-binding
+  namespace: {{ runner_ns }}
+subjects: {{ _uat_subjects | to_json }}
+roleRef:
+  kind: Role
+  name: uat-runner-user-role
+  apiGroup: rbac.authorization.k8s.io
+{% endif %}

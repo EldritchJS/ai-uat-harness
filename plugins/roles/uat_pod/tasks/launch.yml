@@ -1,0 +1,215 @@
+# Assisted by Claude Opus
+- name: "Name {{ step.name }} {{ _uat_entry.id | default('') }}"
+  ansible.builtin.set_fact:
+    _uat_persistent: "{{ step.persistsThroughSweep | default(false) | bool }}"
+    _uat_w: "{{ ('w%02d' | format(_uat_index | int + 1)) if _uat_entry | length > 0 else '' }}"
+    _uat_dir: "{{ uat_step_prefix }}-{{ step.name }}{{ ('-' ~ _uat_entry.id) if _uat_entry | length > 0 else '' }}"
+
+- name: "Set the sweep command of {{ _uat_dir }}"
+  ansible.builtin.set_fact:
+    _uat_name: "uat-{{ uat_tid }}-{{ uat_seq.qid }}-{{ _uat_step_id }}{{ ('-' ~ _uat_w) if _uat_w else '' }}"
+    paramSweep: >-
+      {{ {'id': _uat_entry.id,
+          'command': (step.parameterSweep.baseCommand.args | default([]))
+                     | uat_command((step.parameterSweep.baseCommand.flags | default({}))
+                                   | combine(_uat_entry.flags | default({})))}
+         if _uat_entry | length > 0 else {'id': step.name, 'command': []} }}
+
+- name: "Build the manifests of {{ _uat_dir }}"
+  ansible.builtin.set_fact:
+    _uat_pod_labels: >-
+      {{ _uat_labels | combine({'uat/sweep': _uat_w} if _uat_w else {}) | combine(step.labels | default({})) }}
+    _uat_selector: >-
+      {{ uat_seq_labels | combine({'uat/step': _uat_step_id}) | combine({'uat/sweep': _uat_w} if _uat_w else {}) }}
+    _uat_timeout: "{{ step.timeout | default(uat_deploy_timeout if _uat_persistent | bool else uat_seq_timeout) | int }}"
+    _uat_command: >-
+      {{ ['/binaries/' ~ uat_test ~ '/' ~ uat_builds[uat_test] | default('') ~ '/test.bin',
+          '--ginkgo.label-filter=' ~ step.labelFilter,
+          '--ginkgo.junit-report=/uat_workspace/junit.xml']
+         if (step.labelFilter | default('')) | length > 0
+         else (paramSweep.command if _uat_entry | length > 0
+         else ((step.command.args | default([])) | uat_command(step.command.flags | default({}))
+               if step.command is defined and step.command else [])) }}
+    _uat_env: >-
+      {{ step.env | default([]) | uat_env([{'name': 'RESULTS_DIR', 'value': '/uat_workspace'}]
+                                          if (step.labelFilter | default('')) | length > 0 else []) }}
+    _uat_mounts: >-
+      {{ [{'name': 'workspace', 'mountPath': '/uat_workspace',
+           'subPath': _uat_store.basePath ~ '/' ~ uat_run_id ~ '/' ~ _uat_dir},
+          {'name': 'workspace', 'mountPath': '/binaries', 'subPath': _uat_store.basePath ~ '/builds'},
+          {'name': 'workspace', 'mountPath': scratchpad.mountPath, 'subPath': scratchpad.subPath}]
+         + ([{'name': 'models', 'mountPath': '/models', 'readOnly': true}]
+            if (_uat_store.models.pvc | default('')) | length > 0 else [])
+         + step.volumeMounts | default([]) }}
+    _uat_volumes: >-
+      {{ [{'name': 'workspace', 'persistentVolumeClaim': {'claimName': _uat_store.pvc}}]
+         + ([{'name': 'models', 'persistentVolumeClaim': {'claimName': _uat_store.models.pvc}}]
+            if (_uat_store.models.pvc | default('')) | length > 0 else [])
+         + step.volumes | default([]) }}
+    uat_seq_objects: >-
+      {{ uat_seq_objects + [{'api_version': 'v1', 'kind': 'Pod', 'namespace': namespace},
+                            {'api_version': 'v1', 'kind': 'Service', 'namespace': namespace}] }}
+
+- name: "Render the manifests of {{ _uat_dir }}"
+  ansible.builtin.set_fact:
+    _uat_pod: "{{ lookup('ansible.builtin.template', 'pod.yaml.j2') | from_yaml }}"
+    _uat_svc: >-
+      {{ (lookup('ansible.builtin.template', 'service.yaml.j2') | from_yaml)
+         if step.service.enabled | default(false) | bool else {} }}
+
+- name: "Register the service of {{ _uat_dir }}"
+  ansible.builtin.set_fact:
+    services: >-
+      {{ services | combine({step.service.name: {
+           'name': _uat_name,
+           'url': 'http://' ~ _uat_name ~ ':' ~ step.service.port,
+           'port': step.service.port}}) }}
+  when: step.service.enabled | default(false) | bool
+
+- name: "Create the log directory of {{ _uat_dir }}"
+  ansible.builtin.file:
+    path: "{{ uat_run_dir }}/logs/{{ _uat_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: "Keep the manifests of {{ _uat_dir }}"
+  ansible.builtin.copy:
+    dest: "{{ uat_run_dir }}/logs/{{ _uat_dir }}/manifest.yaml"
+    mode: "0644"
+    content: "{{ ([_uat_pod] + ([_uat_svc] if _uat_svc | length > 0 else [])) | to_nice_yaml(indent=2) }}"
+
+- name: "Start {{ _uat_dir }}"
+  ansible.builtin.set_fact:
+    _uat_t0: "{{ now().timestamp() }}"
+    _uat_started: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+    _uat_status: "{{ 'rendered' if uat_dry_run | bool else 'error' }}"
+    _uat_reason: ""
+    _uat_phase: ""
+    _uat_exit: ""
+    _uat_obj: {}
+    _uat_logs_complete: ~
+
+- name: "Run {{ _uat_dir }}"
+  when: not uat_dry_run | bool
+  block:
+    - name: Create the service
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ _uat_svc }}"
+      when: _uat_svc | length > 0
+
+    - name: Create the pod
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ _uat_pod }}"
+
+    - name: "Wait for {{ _uat_name }} ({{ 'ready' if _uat_persistent | bool else 'done' }}, up to {{ _uat_timeout }}s)"
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ namespace }}"
+        name: "{{ _uat_name }}"
+      register: _uat_poll
+      until: >-
+        (_uat_poll.resources | first | default({})).status.phase | default('') in ['Succeeded', 'Failed']
+        or (_uat_persistent | bool
+            and ((_uat_poll.resources | first | default({})).status.conditions | default([])
+                 | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True')
+                 | list | length > 0))
+      retries: "{{ ((_uat_timeout | int) / (uat_poll_interval | int)) | round(0, 'ceil') | int }}"
+      delay: "{{ uat_poll_interval | int }}"
+      failed_when: false
+
+    - name: Read the pod state
+      ansible.builtin.set_fact:
+        _uat_obj: "{{ _uat_poll.resources | first | default({}) }}"
+
+    - name: Read the main container state
+      ansible.builtin.set_fact:
+        _uat_phase: "{{ _uat_obj.status.phase | default('') }}"
+        _uat_ready: >-
+          {{ _uat_obj.status.conditions | default([]) | selectattr('type', 'equalto', 'Ready')
+             | selectattr('status', 'equalto', 'True') | list | length > 0 }}
+        _uat_cstate: >-
+          {{ (_uat_obj.status.containerStatuses | default([]) | selectattr('name', 'equalto', step.name)
+              | first | default({})).state | default({}) }}
+
+    - name: Decide the outcome
+      ansible.builtin.set_fact:
+        _uat_status: >-
+          {{ 'passed' if _uat_phase == 'Succeeded'
+             else 'failed' if _uat_phase == 'Failed'
+             else 'ready' if _uat_persistent | bool and _uat_ready | bool
+             else 'timeout' }}
+        _uat_exit: "{{ _uat_cstate.terminated.exitCode | default('') }}"
+        _uat_reason: >-
+          {{ _uat_cstate.terminated.reason | default(_uat_cstate.waiting.reason | default(_uat_obj.status.reason | default(''))) }}
+          {{ _uat_cstate.waiting.message | default(_uat_cstate.terminated.message | default('')) | truncate(300) }}
+
+  rescue:
+    - name: Note the error
+      ansible.builtin.set_fact:
+        _uat_status: error
+        _uat_reason: "{{ ansible_failed_task.name }}: {{ ansible_failed_result.msg | default('') | string | truncate(500) }}"
+
+- name: "Finish the logs of {{ _uat_dir }}"
+  ansible.builtin.include_tasks: logs.yml
+  when: not uat_dry_run | bool and not (_uat_persistent | bool and _uat_status == 'ready')
+
+- name: "Delete {{ _uat_dir }}"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: "{{ item }}"
+    namespace: "{{ namespace }}"
+    name: "{{ _uat_name }}"
+    wait: true
+    wait_timeout: "{{ uat_delete_timeout }}"
+  loop: "{{ ['Pod'] + (['Service'] if _uat_svc | length > 0 else []) }}"
+  when: not uat_dry_run | bool and not _uat_persistent | bool
+  failed_when: false
+
+- name: "Record {{ _uat_dir }}"
+  ansible.builtin.copy:
+    dest: "{{ uat_run_dir }}/steps/{{ _uat_dir }}.json"
+    mode: "0644"
+    content: >-
+      {{ {
+           'run': uat_run_id,
+           'tid': uat_tid,
+           'test_id': uat_test_id | int,
+           'test': uat_test,
+           'mode': uat_seq_mode,
+           'sequence': uat_seq.qid,
+           'sequence_label': uat_seq.label,
+           'nodes': uat_seq.nodes,
+           'node': node,
+           'step_index': uat_step_counter | int,
+           'step': step.name,
+           'sweep': _uat_entry.id | default(''),
+           'sweep_index': (_uat_index | int + 1) if _uat_entry | length > 0 else 0,
+           'description': _uat_entry.description | default(''),
+           'dir': _uat_dir,
+           'kind': 'Pod',
+           'persistent': _uat_persistent | bool,
+           'namespace': namespace,
+           'name': _uat_name,
+           'service': _uat_name if _uat_svc | length > 0 else '',
+           'image': step.image,
+           'command': _uat_command,
+           'status': _uat_status,
+           'phase': _uat_phase,
+           'exit_code': _uat_exit,
+           'reason': _uat_reason | trim,
+           'started': _uat_started,
+           'finished': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ'),
+           'duration_s': ((now().timestamp() - (_uat_t0 | float)) | round(1)),
+           'pvc': _uat_store.pvc,
+           'results_dir': _uat_store.basePath ~ '/' ~ uat_run_id ~ '/' ~ _uat_dir,
+           'logs': 'logs/' ~ _uat_dir,
+           'logs_complete': _uat_logs_complete
+         } | to_nice_json }}
+
+- name: "Stop after {{ _uat_dir }} {{ _uat_status }}"
+  ansible.builtin.fail:
+    msg: "{{ _uat_dir }} {{ _uat_status }} ({{ _uat_reason | trim }}); on_failure is {{ uat_seq_on_failure }}"
+  when: _uat_status in ['failed', 'timeout', 'error'] and uat_seq_on_failure != 'continue'

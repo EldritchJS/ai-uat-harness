@@ -1,0 +1,131 @@
+# Assisted by Claude Opus
+- name: Plan chunked-prefill
+  ansible.builtin.import_playbook: ../plugins/playbooks/sequences.yml
+  vars:
+    uat_test: chunked-prefill
+    uat_modes: [node, serial]
+    uat_on_failure: abort
+    uat_timeout: 900
+
+- name: chunked-prefill
+  hosts: "{{ hostvars.localhost.uat_hosts | default('uat_none') }}"
+  serial: "{{ hostvars.localhost.uat_serial | default(0) }}"
+  gather_facts: false
+  vars:
+    serverConfig:
+      model: /models/ibm-granite/granite-3.3-8b-instruct
+  tasks:
+    - name: Start the sequence
+      ansible.builtin.import_role:
+        name: uat_sequence
+
+    - name: Steps
+      block:
+        - name: vllm-server
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: vllm-server
+              image: ghcr.io/llm-d/llm-d-cuda:v0.8.0
+              service:
+                enabled: true
+                port: 8000
+                name: vllm-server
+                headless: true
+              command:
+                args: [python, -m, vllm.entrypoints.openai.api_server]
+                flags:
+                  model: "{{ serverConfig.model }}"
+                  port: 8000
+                  tensor-parallel-size: '{{ nodeSpec.componentValidation.sanity["nvidia.com/gpu"] }}'
+                  enable-chunked-prefill: ~
+              env:
+                - name: HOME
+                  value: /tmp
+              ports:
+                - {containerPort: 8000, name: http}
+              readinessProbe:
+                httpGet: {path: /health, port: 8000}
+                initialDelaySeconds: 30
+                periodSeconds: 10
+                timeoutSeconds: 5
+                failureThreshold: 30
+              resources:
+                requests:
+                  nvidia.com/gpu: '{{ nodeSpec.componentValidation.sanity["nvidia.com/gpu"] }}'
+                limits:
+                  nvidia.com/gpu: '{{ nodeSpec.componentValidation.sanity["nvidia.com/gpu"] }}'
+              volumes:
+                - name: dshm
+                  emptyDir: {medium: Memory, sizeLimit: 16Gi}
+              volumeMounts:
+                - {name: dshm, mountPath: /dev/shm}
+              persistsThroughSweep: true
+
+        - name: pass-fail
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: pass-fail
+              image: registry.redhat.io/ubi9/ubi:9.8
+              labelFilter: pass-fail
+              env:
+                - name: SERVER_URL
+                  value: '{{ services["vllm-server"]["url"] }}'
+                - name: MODEL_NAME
+                  value: "{{ serverConfig.model }}"
+
+        - name: sweep
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: sweep
+              image: quay.io/inference-perf/inference-perf:v0.6.1
+              labelFilter: quantitative
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: SERVER_URL
+                  value: '{{ services["vllm-server"]["url"] }}'
+                - name: SWEEP_COMMAND
+                  value: "{{ paramSweep.command | to_json }}"
+              parameterSweep:
+                baseCommand:
+                  args: [inference-perf]
+                  flags:
+                    server.type: vllm
+                    server.base_url: '{{ services["vllm-server"]["url"] }}'
+                    server.model_name: "{{ serverConfig.model }}"
+                    server.ignore_eos: "true"
+                    api.type: completion
+                    api.streaming: "true"
+                    data.type: shared_prefix
+                    data.shared_prefix.num_groups: 500
+                    data.shared_prefix.num_prompts_per_group: 1
+                    data.shared_prefix.system_prompt_len: 16000
+                    data.shared_prefix.question_len: 250
+                    data.shared_prefix.output_len: 128
+                    load.type: constant
+                    load.num_workers: 1
+                    load.worker_max_concurrency: 1
+                    storage.local_storage.path: /uat_workspace
+                    report.request_lifecycle.summary: "true"
+                    report.request_lifecycle.per_request: "false"
+                entries:
+                  - id: stress
+                    description: Ramped load stress test for chunked prefill inference
+                    flags:
+                      load.stages: '[{"rate": 0.25, "duration": 30}, {"rate": 0.5, "duration": 30}, {"rate": 0.75, "duration": 30}, {"rate": 1, "duration": 30}]'
+      rescue:
+        - name: Handle the failure
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: failed
+      always:
+        - name: Tear down
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: teardown

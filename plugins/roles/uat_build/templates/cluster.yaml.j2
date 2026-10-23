@@ -1,0 +1,13 @@
+# Assisted by Claude Opus
+apiVersion: uat.openshift.io/v1
+kind: ClusterTest
+metadata:
+  name: {{ uat_cluster_name | default('cluster') | to_json }}
+spec:
+  compliance: {{ uat_compliance | default({'fipsEnabled': false}) | to_json }}
+  namespace: {{ uat_namespace | to_json }}
+  nodes:
+{% for n in groups['uat_nodes'] | default([]) %}
+    - name: {{ n | to_json }}
+      componentValidation: {{ hostvars[n].componentValidation | default({}) | to_json }}
+{% endfor %}

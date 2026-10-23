@@ -1,0 +1,57 @@
+# Assisted by Claude Opus
+- name: Check whether the run still needs finishing
+  ansible.builtin.set_fact:
+    _uat_finishing: "{{ (uat_run_started | default(false) | bool) and not (uat_run_finished | default(false) | bool) }}"
+
+- name: Finish the run
+  when: _uat_finishing | bool
+  block:
+    - name: Ask the log streamer to stop
+      ansible.builtin.copy:
+        dest: "{{ uat_run_dir }}/meta/streams/stop"
+        mode: "0644"
+        content: ""
+
+    - name: Wait for the log streamer to close its streams
+      ansible.builtin.wait_for:
+        path: "{{ uat_run_dir }}/meta/streams/alive"
+        state: absent
+        timeout: 120
+      failed_when: false
+
+    - name: Delete the builders
+      ansible.builtin.include_role:
+        name: uat_build
+        tasks_from: stop
+      when: not uat_dry_run | bool
+
+    - name: Collect results from each namespace
+      ansible.builtin.include_tasks: collect.yml
+      loop: "{{ uat_storages }}"
+      loop_control:
+        loop_var: uat_store
+        label: "{{ uat_store.namespace }}"
+      when: not uat_dry_run | bool
+
+    - name: Summarize the run
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ role_path }}/files/summarize.py"
+          - "{{ uat_run_dir }}"
+      register: _uat_summary
+      changed_when: false
+      failed_when: false
+
+    - name: Show the summary
+      ansible.builtin.debug:
+        msg: "{{ _uat_summary.stdout_lines + ['', 'Run directory: ' ~ uat_run_dir] }}"
+
+    - name: Mark the run finished
+      ansible.builtin.set_fact:
+        uat_run_finished: true
+
+    - name: Fail when any step failed
+      ansible.builtin.fail:
+        msg: "Run {{ uat_run_id }} has failures; see {{ uat_run_dir }}/summary.txt"
+      when: _uat_summary.rc != 0

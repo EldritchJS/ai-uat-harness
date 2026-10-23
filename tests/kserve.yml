@@ -1,0 +1,93 @@
+# Assisted by Claude Opus
+- name: Plan kserve
+  ansible.builtin.import_playbook: ../plugins/playbooks/sequences.yml
+  vars:
+    uat_test: kserve
+    uat_modes: [project]
+    uat_timeout: 900
+
+- name: kserve
+  hosts: "{{ hostvars.localhost.uat_hosts | default('uat_none') }}"
+  serial: "{{ hostvars.localhost.uat_serial | default(0) }}"
+  gather_facts: false
+  vars:
+    serverConfig:
+      model: /models/ibm-granite/granite-3.3-8b-instruct
+      image: nvcr.io/nvidia/vllm:26.03-py3
+      gpuCount: "1"
+      modelsPVC: "{{ uat_storage.models.pvc }}"
+  tasks:
+    - name: Start the sequence
+      ansible.builtin.import_role:
+        name: uat_sequence
+
+    - name: Steps
+      block:
+        - name: isvc
+          ansible.builtin.include_role:
+            name: uat_resource
+          vars:
+            step:
+              name: isvc
+              resourceConfig:
+                apiVersion: serving.kserve.io/v1beta1
+                kind: InferenceService
+                annotations:
+                  serving.kserve.io/deploymentMode: RawDeployment
+                spec:
+                  predictor:
+                    tolerations:
+                      - key: nvidia.com/gpu.product
+                        operator: Exists
+                        effect: NoSchedule
+                    containers:
+                      - name: kserve-container
+                        image: "{{ serverConfig.image }}"
+                        command: [python, -m, vllm.entrypoints.openai.api_server]
+                        args:
+                          - "--model={{ serverConfig.model }}"
+                          - --port=8080
+                          - --max-model-len=10000
+                          - --gpu-memory-utilization=0.6
+                        env:
+                          - name: HOME
+                            value: /tmp
+                        ports:
+                          - containerPort: 8080
+                            protocol: TCP
+                        resources:
+                          requests:
+                            nvidia.com/gpu: "{{ serverConfig.gpuCount }}"
+                          limits:
+                            nvidia.com/gpu: "{{ serverConfig.gpuCount }}"
+                        volumeMounts:
+                          - name: models
+                            mountPath: /models
+                    volumes:
+                      - name: models
+                        persistentVolumeClaim:
+                          claimName: "{{ serverConfig.modelsPVC }}"
+
+        - name: test-runner
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: test-runner
+              image: registry.redhat.io/ubi9/ubi:9.8
+              labelFilter: pass-fail
+              env:
+                - name: SERVICE_URL
+                  value: "http://{{ resource_name }}-predictor.{{ namespace }}.svc.cluster.local:8080"
+                - name: MODEL_NAME
+                  value: "{{ serverConfig.model }}"
+      rescue:
+        - name: Handle the failure
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: failed
+      always:
+        - name: Tear down
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: teardown

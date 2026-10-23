@@ -1,0 +1,11 @@
+# Assisted by Claude Opus
+- name: fio
+  ansible.builtin.import_playbook: ../fio.yml
+  vars:
+    uat_mode: serial
+
+- name: fio-virt
+  ansible.builtin.import_playbook: ../fio-virt.yml
+
+- name: Finish
+  ansible.builtin.import_playbook: ../../plugins/playbooks/finish.yml

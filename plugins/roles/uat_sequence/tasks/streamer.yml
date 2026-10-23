@@ -1,0 +1,16 @@
+# Assisted by Claude Opus
+- name: Start the log streamer of the run if it is not running
+  ansible.builtin.command:
+    argv: >-
+      {{ [ansible_playbook_python, role_path ~ '/../uat_run/files/pod_logs.py', uat_run_dir, uat_run_id,
+          lookup('ansible.builtin.pipe', _uat_ansible_pid)]
+         + uat_storages | map(attribute='namespace') | list }}
+  vars:
+    _uat_ansible_pid: awk '/^PPid:/ {print $2}' /proc/$PPID/status
+  async: "{{ uat_runner_timeout }}"
+  poll: 0
+  changed_when: false
+  when: >-
+    not uat_dry_run | bool
+    and now().timestamp() - (lookup('ansible.builtin.file', uat_run_dir ~ '/meta/streams/alive', errors='ignore')
+                             | default(0, true) | float) > 30

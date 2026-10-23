@@ -1,0 +1,88 @@
+# Assisted by Claude Opus
+all:
+  vars:
+    uat_cluster_name: oac-dev-workload0
+    uat_compliance:
+      fipsEnabled: false
+
+    uat_namespace: uat-project
+    uat_storage:
+      pvc: uat-project-storage
+      basePath: uat/results
+      models:
+        pvc: uat-models
+
+    uat_peer_namespace: uat-peer
+    uat_peer_storage:
+      pvc: uat-peer-storage
+      basePath: uat/results
+      models:
+        pvc: uat-models
+
+    uat_runner:
+      namespace: uat-runner
+      serviceAccount: uat-runner-sa
+      pvc: uat-runner-storage
+
+  children:
+    uat_nodes:
+      vars:
+        ansible_connection: local
+      hosts:
+        moc-r4pcc02u05:
+          componentValidation:
+            sanity:
+              nvidia.com/gpu: 4
+              nvidia.com/gpu.memory: 81559
+              cpu: 512
+              resourceNames:
+                nvidia.com/gpu: NVIDIA-H100-80GB-HBM3
+                cpu: AMD EPYC 9754 128-Core Processor
+              nvlink: NV6
+              nvlinkTopology: all-to-all
+              nvlinkP2pBandwidth: 150
+              pcieWidth: 16
+              pcieGen: 5
+              memory: 1512Gi
+              numaNodes: 2
+            ideal:
+              cudaDriverVersion: "595.91.07"
+              gpuPowerLimit: 700
+              gpuPersistenceMode: true
+              kernel: 5.14.0-687.46.1.el9_8.x86_64
+              hugepages: 8000Mi
+              cpuFreqGovernor: performance
+              cpuIdleDriver: acpi_idle
+              cpuIdleGovernor: menu
+              # AMD acpi_idle C2 is equivalent to Intel C1E (low single-digit us wake-up)
+              cpuCStatesEnabled: [POLL, C1, C2]
+              transparentHugepages: madvise
+
+        moc-r4pcc02u09:
+          componentValidation:
+            sanity:
+              nvidia.com/gpu: 4
+              nvidia.com/gpu.memory: 81559
+              cpu: 512
+              resourceNames:
+                nvidia.com/gpu: NVIDIA-H100-80GB-HBM3
+                cpu: AMD EPYC 9754 128-Core Processor
+              nvlink: NV6
+              nvlinkTopology: all-to-all
+              nvlinkP2pBandwidth: 150
+              pcieWidth: 16
+              pcieGen: 5
+              memory: 1512Gi
+              numaNodes: 2
+            ideal:
+              cudaDriverVersion: "595.91.07"
+              gpuPowerLimit: 700
+              gpuPersistenceMode: true
+              kernel: 5.14.0-687.46.1.el9_8.x86_64
+              hugepages: 8000Mi
+              cpuFreqGovernor: performance
+              cpuIdleDriver: acpi_idle
+              cpuIdleGovernor: menu
+              # AMD acpi_idle C2 is equivalent to Intel C1E (low single-digit us wake-up)
+              cpuCStatesEnabled: [POLL, C1, C2]
+              transparentHugepages: madvise

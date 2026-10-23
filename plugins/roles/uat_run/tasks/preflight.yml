@@ -1,0 +1,55 @@
+# Assisted by Claude Opus
+- name: "Find objects left by earlier runs in {{ uat_store.namespace }}"
+  kubernetes.core.k8s_info:
+    api_version: "{{ item.api_version }}"
+    kind: "{{ item.kind }}"
+    namespace: "{{ uat_store.namespace }}"
+    label_selectors:
+      - "app.kubernetes.io/managed-by={{ uat_managed_by }}"
+  loop: "{{ uat_cleanup_kinds }}"
+  loop_control:
+    label: "{{ item.kind }}"
+  register: _uat_leftovers
+  failed_when: false
+
+- name: "Look for a run still going in {{ uat_store.namespace }}"
+  ansible.builtin.set_fact:
+    _uat_active_runs: >-
+      {{ (_uat_leftovers.results | selectattr('item.kind', 'equalto', 'Pod') | first).resources | default([])
+         | rejectattr('metadata.deletionTimestamp', 'defined')
+         | selectattr('status.phase', 'in', ['Pending', 'Running'])
+         | map(attribute='metadata.labels') | map(attribute='uat/run', default='?') | unique | list }}
+
+- name: "Stop if another run is still going in {{ uat_store.namespace }}"
+  ansible.builtin.assert:
+    that: _uat_active_runs | length == 0 or uat_preflight_force | default(false) | bool
+    fail_msg: >-
+      Harness pods from run(s) {{ _uat_active_runs | join(', ') }} are still running in {{ uat_store.namespace }}.
+      Starting a run here deletes them. Wait for that run to finish, or pass -e uat_preflight_force=true.
+    quiet: true
+
+- name: "Delete objects left by earlier runs in {{ uat_store.namespace }}"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: "{{ item.0.item.api_version }}"
+    kind: "{{ item.0.item.kind }}"
+    namespace: "{{ uat_store.namespace }}"
+    name: "{{ item.1.metadata.name }}"
+    wait: true
+    wait_timeout: "{{ uat_delete_timeout }}"
+  loop: "{{ _uat_leftovers.results | selectattr('resources', 'defined') | subelements('resources') }}"
+  loop_control:
+    label: "{{ item.0.item.kind }}/{{ item.1.metadata.name }}"
+  when: item.1.metadata.deletionTimestamp is not defined
+  register: _uat_deleted
+
+- name: "Record the preflight in {{ uat_store.namespace }}"
+  ansible.builtin.copy:
+    dest: "{{ uat_run_dir }}/logs/preflight-{{ uat_store.role }}.json"
+    mode: "0644"
+    content: >-
+      {%- set deleted = [] -%}
+      {%- for r in _uat_deleted.results | default([]) if not r.skipped | default(false) -%}
+      {%- set _ = deleted.append(r.item.0.item.kind ~ '/' ~ r.item.1.metadata.name) -%}
+      {%- endfor -%}
+      {{ {'namespace': uat_store.namespace, 'deleted': deleted} | to_nice_json }}

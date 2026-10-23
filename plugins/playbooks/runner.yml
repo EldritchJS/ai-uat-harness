@@ -1,0 +1,8 @@
+# Assisted by Claude Opus
+- name: Run in a runner pod
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Run
+      ansible.builtin.import_role:
+        name: uat_runner

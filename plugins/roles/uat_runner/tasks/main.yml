@@ -1,0 +1,149 @@
+# Assisted by Claude Opus
+- name: Check the runner settings
+  ansible.builtin.assert:
+    that:
+      - uat_runner.namespace is defined
+      - uat_runner.serviceAccount is defined
+      - uat_runner.pvc is defined
+    fail_msg: The cluster config needs uat_runner.namespace, uat_runner.serviceAccount and uat_runner.pvc to run in a pod.
+    quiet: true
+
+- name: Name the runner pod
+  ansible.builtin.set_fact:
+    _uat_runner_pod: "uat-runner-{{ uat_run_id | lower | regex_replace('[^a-z0-9]+', '-') }}"
+    _uat_run_dir: "{{ uat_runs_dir }}/{{ uat_run_id }}"
+    _uat_local_source: "{{ (uat_runner_repo | default('')) | length == 0 }}"
+
+- name: Read the git state of the local files
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ role_path }}/../uat_run/files/provenance.py"
+      - "{{ uat_repo_dir }}"
+  register: _uat_local_provenance
+  changed_when: false
+  when: _uat_local_source | bool
+
+- name: Start the runner pod
+  kubernetes.core.k8s:
+    state: present
+    wait: true
+    wait_condition:
+      type: Ready
+      status: "True"
+    wait_timeout: "{{ uat_deploy_timeout }}"
+    definition:
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: "{{ _uat_runner_pod }}"
+        namespace: "{{ uat_runner.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: "{{ uat_managed_by }}"
+          uat/run: "{{ uat_run_id }}"
+          uat/role: runner
+      spec:
+        serviceAccountName: "{{ uat_runner.serviceAccount }}"
+        restartPolicy: Never
+        containers:
+          - name: runner
+            image: "{{ uat_runner_image }}"
+            command:
+              - bash
+              - -c
+              - "{{ lookup('ansible.builtin.file', 'runner.sh') }}"
+            env:
+              - {name: UAT_RUNS_DIR, value: /uat_workspace/runs}
+              - {name: REPO_URL, value: "{{ uat_runner_repo | default('') }}"}
+              - {name: REPO_REF, value: "{{ uat_runner_ref | default('') }}"}
+              - {name: DEPLOY_ARGS, value: "{{ uat_runner_args }}"}
+              - name: UAT_SOURCE
+                value: "{{ ((_uat_local_provenance.stdout | from_json).git | to_json) if _uat_local_source | bool else '' }}"
+              - {name: PYTHONUNBUFFERED, value: "1"}
+            resources:
+              requests: {cpu: "1", memory: 2Gi}
+              limits: {cpu: "4", memory: 4Gi}
+            volumeMounts:
+              - {name: workspace, mountPath: /uat_workspace}
+              - {name: src, mountPath: /src}
+        volumes:
+          - name: workspace
+            persistentVolumeClaim:
+              claimName: "{{ uat_runner.pvc }}"
+          - name: src
+            emptyDir: {}
+
+- name: Hand the local files to the runner pod
+  when: _uat_local_source | bool
+  block:
+    - name: Make a staging file
+      ansible.builtin.tempfile:
+        state: file
+        suffix: .tgz
+      register: _uat_src
+
+    - name: Pack the repository without git history, collections or runs
+      ansible.builtin.command:
+        argv:
+          - tar
+          - czf
+          - "{{ _uat_src.path }}"
+          - --exclude=./.git
+          - --exclude=./collections
+          - --exclude=./runs
+          - -C
+          - "{{ uat_repo_dir }}"
+          - .
+      changed_when: false
+
+    - name: Copy the package into the runner pod
+      kubernetes.core.k8s_cp:
+        namespace: "{{ uat_runner.namespace }}"
+        pod: "{{ _uat_runner_pod }}"
+        state: to_pod
+        local_path: "{{ _uat_src.path }}"
+        remote_path: /src/src.tgz
+
+    - name: Unpack the package in the runner pod
+      kubernetes.core.k8s_exec:
+        namespace: "{{ uat_runner.namespace }}"
+        pod: "{{ _uat_runner_pod }}"
+        command: sh -c "mkdir -p /src/repo && tar xzf /src/src.tgz -C /src/repo && touch /src/.ready"
+  always:
+    - name: Remove the local package
+      ansible.builtin.file:
+        path: "{{ _uat_src.path }}"
+        state: absent
+      when: _uat_src.path is defined
+
+- name: Say how to follow the run
+  ansible.builtin.debug:
+    msg:
+      - "Runner pod {{ uat_runner.namespace }}/{{ _uat_runner_pod }} started for run {{ uat_run_id }}."
+      - "Follow it with: oc logs -f {{ _uat_runner_pod }} -n {{ uat_runner.namespace }}"
+      - "Copy it back later with: ./deploy.sh -c <cluster> -F {{ uat_run_id }}"
+
+- name: Wait for the runner and copy the run back
+  when: not (uat_runner_detach | default(false) | bool)
+  block:
+    - name: "Wait for the runner (up to {{ uat_runner_timeout }}s)"
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ uat_runner.namespace }}"
+        name: "{{ _uat_runner_pod }}"
+      register: _uat_runner
+      until: (_uat_runner.resources | first | default({})).status.phase | default('') in ['Succeeded', 'Failed']
+      retries: "{{ ((uat_runner_timeout | int) / 30) | round(0, 'ceil') | int }}"
+      delay: 30
+
+    - name: Copy the run back
+      ansible.builtin.include_tasks: fetch.yml
+
+    - name: Show the summary
+      ansible.builtin.debug:
+        msg: "{{ lookup('ansible.builtin.file', _uat_run_dir ~ '/summary.txt', errors='ignore').splitlines() + ['', 'Run directory: ' ~ _uat_run_dir] }}"
+
+    - name: Fail when the run failed
+      ansible.builtin.fail:
+        msg: "The runner pod ended {{ (_uat_runner.resources | first).status.phase }}; see {{ _uat_run_dir }}/runner.log and summary.txt"
+      when: (_uat_runner.resources | first).status.phase != 'Succeeded'
