@@ -1,0 +1,29 @@
+# Assisted by Claude Opus
+- name: Check the cluster config
+  ansible.builtin.assert:
+    that:
+      - uat_namespace is defined
+      - uat_storage.pvc is defined
+      - uat_storage.basePath is defined
+    fail_msg: Run with -i clusters/<cluster>.yml; it must set uat_namespace and uat_storage.
+    quiet: true
+
+- name: Set the run id
+  ansible.builtin.set_fact:
+    uat_run_id: "{{ uat_run_id | default(now(utc=true, fmt='%Y%m%d_%H%M%S'), true) }}"
+
+- name: Set the run context
+  ansible.builtin.set_fact:
+    uat_run_dir: "{{ uat_runs_dir }}/{{ uat_run_id }}"
+    uat_run_slug: "{{ uat_run_id | lower | regex_replace('[^a-z0-9]+', '-') }}"
+    uat_storages: >-
+      {{ [uat_storage | combine({'role': 'project', 'namespace': uat_namespace})]
+         + ([uat_peer_storage | combine({'role': 'peer', 'namespace': uat_peer_namespace})]
+            if (uat_peer_namespace | default('')) | length > 0 else []) }}
+
+- name: Create the run directory
+  ansible.builtin.file:
+    path: "{{ uat_run_dir }}/{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: [meta, meta/streams, steps, tests, logs, results]

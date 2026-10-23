@@ -1,0 +1,16 @@
+# Assisted by Claude Opus
+- name: Render the cluster spec and find where each test runs its Go binary
+  ansible.builtin.set_fact:
+    uat_cluster_spec: "{{ lookup('ansible.builtin.template', 'cluster.yaml.j2') }}"
+    uat_go_places: "{{ _uat_playbooks | uat_go_places(query('ansible.builtin.file', *_uat_playbooks) | map('from_yaml') | list) }}"
+    uat_builds: {}
+    uat_builder_errors: {}
+    uat_build_failures: []
+  vars:
+    _uat_playbooks: "{{ query('ansible.builtin.fileglob', uat_tests_dir ~ '/*.yml') | sort }}"
+
+- name: Keep the cluster spec with the run
+  ansible.builtin.copy:
+    dest: "{{ uat_run_dir }}/meta/cluster.yaml"
+    mode: "0644"
+    content: "{{ uat_cluster_spec }}"

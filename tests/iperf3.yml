@@ -1,0 +1,86 @@
+# Assisted by Claude Opus
+- name: Plan iperf3
+  ansible.builtin.import_playbook: ../plugins/playbooks/sequences.yml
+  vars:
+    uat_test: iperf3
+    uat_modes: [pairs, node, project]
+
+- name: iperf3
+  hosts: "{{ hostvars.localhost.uat_hosts | default('uat_none') }}"
+  serial: "{{ hostvars.localhost.uat_serial | default(0) }}"
+  gather_facts: false
+  vars:
+    iperf3_image: docker.io/networkstatic/iperf3:latest
+    iperf3_resources:
+      requests: {cpu: 16, memory: 32Gi}
+      limits: {cpu: 16, memory: 32Gi}
+  tasks:
+    - name: Start the sequence
+      ansible.builtin.import_role:
+        name: uat_sequence
+
+    - name: Steps
+      block:
+        - name: iperf-server
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: iperf-server
+              image: "{{ iperf3_image }}"
+              command:
+                args: [iperf3, -s]
+              service:
+                enabled: true
+                port: 5201
+                name: iperf-server
+                headless: true
+              ports:
+                - {containerPort: 5201, name: iperf}
+              readinessProbe:
+                tcpSocket: {port: 5201}
+                initialDelaySeconds: 5
+                periodSeconds: 5
+                failureThreshold: 6
+              resources: "{{ iperf3_resources }}"
+              persistsThroughSweep: true
+
+        - name: iperf-client
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: iperf-client
+              nodeIndex: 1
+              image: "{{ iperf3_image }}"
+              labelFilter: pass-fail
+              resources: "{{ iperf3_resources }}"
+              env:
+                - name: SERVER_HOST
+                  value: '{{ services["iperf-server"].name }}'
+                - name: SWEEP_COMMAND
+                  value: "{{ paramSweep.command | to_json }}"
+              parameterSweep:
+                baseCommand:
+                  args: [iperf3]
+                  flags:
+                    client: '{{ services["iperf-server"].name }}'
+                    time: 10
+                    omit: 2
+                    json: ~
+                entries:
+                  - {id: streams-1, description: 1 parallel stream, flags: {parallel: 1}}
+                  - {id: streams-2, description: 2 parallel streams, flags: {parallel: 2}}
+                  - {id: streams-4, description: 4 parallel streams, flags: {parallel: 4}}
+                  - {id: streams-8, description: 8 parallel streams, flags: {parallel: 8}}
+                  - {id: streams-16, description: 16 parallel streams, flags: {parallel: 16}}
+      rescue:
+        - name: Handle the failure
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: failed
+      always:
+        - name: Tear down
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: teardown

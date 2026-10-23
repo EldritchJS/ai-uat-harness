@@ -1,0 +1,62 @@
+# Assisted by Claude Opus
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ _uat_name }}
+  namespace: {{ namespace }}
+  labels: {{ _uat_pod_labels | to_json }}
+spec:
+  restartPolicy: Never
+{% if (step.serviceAccountName | default('')) | length > 0 %}
+  serviceAccountName: {{ step.serviceAccountName | to_json }}
+{% endif %}
+{% if node %}
+  nodeSelector: {{ {uat_node_selector_key: node} | to_json }}
+{% endif %}
+  tolerations: {{ uat_tolerations | to_json }}
+{% if step.privileged | default(false) | bool %}
+  hostPID: true
+{% endif %}
+{% if step.sidecars | default([]) | length > 0 %}
+  initContainers:
+{% for sc in step.sidecars %}
+    - name: {{ sc.name | to_json }}
+      image: {{ sc.image | to_json }}
+      restartPolicy: Always
+{% if sc.command | default([]) | length > 0 %}
+      command: {{ sc.command | map('string') | list | to_json }}
+{% endif %}
+{% if sc.args | default([]) | length > 0 %}
+      args: {{ sc.args | map('string') | list | to_json }}
+{% endif %}
+{% if sc.env | default([]) | length > 0 %}
+      env: {{ sc.env | uat_env | to_json }}
+{% endif %}
+{% for key in ['ports', 'resources', 'volumeMounts'] if sc[key] is defined and sc[key] %}
+      {{ key }}: {{ sc[key] | to_json }}
+{% endfor %}
+{% endfor %}
+{% endif %}
+  containers:
+    - name: {{ step.name | to_json }}
+      image: {{ step.image | to_json }}
+{% if _uat_command | length > 0 %}
+      command: {{ _uat_command | to_json }}
+{% endif %}
+{% if _uat_env | length > 0 %}
+      env: {{ _uat_env | to_json }}
+{% endif %}
+{% if step.ports | default([]) | length > 0 %}
+      ports: {{ step.ports | to_json }}
+{% endif %}
+{% if step.readinessProbe | default({}) | length > 0 %}
+      readinessProbe: {{ step.readinessProbe | to_json }}
+{% endif %}
+{% if step.resources | default({}) | length > 0 %}
+      resources: {{ step.resources | to_json }}
+{% endif %}
+      volumeMounts: {{ _uat_mounts | to_json }}
+{% if step.privileged | default(false) | bool %}
+      securityContext: {"privileged": true}
+{% endif %}
+  volumes: {{ _uat_volumes | to_json }}

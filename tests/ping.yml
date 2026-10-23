@@ -1,0 +1,111 @@
+# Assisted by Claude Opus
+- name: Plan ping
+  ansible.builtin.import_playbook: ../plugins/playbooks/sequences.yml
+  vars:
+    uat_test: ping
+    uat_modes: [project, node, serial]
+
+- name: ping
+  hosts: "{{ hostvars.localhost.uat_hosts | default('uat_none') }}"
+  serial: "{{ hostvars.localhost.uat_serial | default(0) }}"
+  gather_facts: false
+  vars:
+    serverConfig:
+      projectNamespace: "{{ uat_namespace }}"
+      peerNamespace: "{{ uat_peer_namespace }}"
+  tasks:
+    - name: Start the sequence
+      ansible.builtin.import_role:
+        name: uat_sequence
+
+    - name: Steps
+      block:
+        - name: project-server
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: project-server
+              image: registry.redhat.io/ubi9/ubi:9.8
+              command:
+                args: [python3, -m, http.server, "8080"]
+              service:
+                enabled: true
+                port: 8080
+                name: project-server
+                headless: true
+              ports:
+                - containerPort: 8080
+              readinessProbe:
+                httpGet: {path: /, port: 8080}
+                initialDelaySeconds: 2
+                periodSeconds: 5
+                failureThreshold: 6
+              persistsThroughSweep: true
+
+        - name: peer-server
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: peer-server
+              image: registry.redhat.io/ubi9/ubi:9.8
+              peer: true
+              command:
+                args: [python3, -m, http.server, "8080"]
+              service:
+                enabled: true
+                port: 8080
+                name: peer-server
+                headless: true
+              ports:
+                - containerPort: 8080
+              readinessProbe:
+                httpGet: {path: /, port: 8080}
+                initialDelaySeconds: 2
+                periodSeconds: 5
+                failureThreshold: 6
+              persistsThroughSweep: true
+
+        - name: project-check
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: project-check
+              image: registry.redhat.io/ubi9/ubi:9.8
+              labelFilter: project-check
+              env:
+                - name: OWN_URL
+                  value: '{{ services["project-server"].url }}'
+                - name: OTHER_SHORT_URL
+                  value: '{{ services["peer-server"].url }}'
+                - name: OTHER_FQDN_URL
+                  value: 'http://{{ services["peer-server"].name }}.{{ serverConfig.peerNamespace }}.svc.cluster.local:{{ services["peer-server"].port }}'
+
+        - name: peer-check
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: peer-check
+              image: registry.redhat.io/ubi9/ubi:9.8
+              peer: true
+              labelFilter: peer-check
+              env:
+                - name: OWN_URL
+                  value: '{{ services["peer-server"].url }}'
+                - name: OTHER_SHORT_URL
+                  value: '{{ services["project-server"].url }}'
+                - name: OTHER_FQDN_URL
+                  value: 'http://{{ services["project-server"].name }}.{{ serverConfig.projectNamespace }}.svc.cluster.local:{{ services["project-server"].port }}'
+      rescue:
+        - name: Handle the failure
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: failed
+      always:
+        - name: Tear down
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: teardown

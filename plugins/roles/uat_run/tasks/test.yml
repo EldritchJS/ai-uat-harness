@@ -1,0 +1,100 @@
+# Assisted by Claude Opus
+- name: Start the run if this is the first test
+  ansible.builtin.import_tasks: start.yml
+
+- name: Number the test
+  ansible.builtin.set_fact:
+    uat_test_counter: "{{ uat_test_counter | int + 1 }}"
+
+- name: "Plan {{ uat_test }}"
+  ansible.builtin.set_fact:
+    _uat_tid: "t{{ '%03d' | format(uat_test_counter | int) }}"
+    _uat_mode: "{{ uat_mode | default(uat_modes | first) }}"
+    _uat_only: >-
+      {{ [] if (uat_only_nodes | default('')) | length == 0
+         else (uat_only_nodes | split(',') if uat_only_nodes is string else uat_only_nodes) }}
+
+- name: "Pick nodes for {{ uat_test }}"
+  ansible.builtin.set_fact:
+    _uat_nodes: >-
+      {{ (groups['uat_nodes'] | default([]) | select('in', _uat_only) | list)
+         if _uat_only | length > 0 else groups['uat_nodes'] | default([]) }}
+
+- name: "Check the mode of {{ uat_test }}"
+  ansible.builtin.assert:
+    that:
+      - _uat_mode in uat_modes
+      - _uat_mode == 'project' or _uat_nodes | length > 0
+      - _uat_mode != 'pairs' or _uat_nodes | length > 1
+    fail_msg: >-
+      {{ uat_test }} supports modes {{ uat_modes }}; got {{ _uat_mode }} with nodes {{ _uat_nodes }}
+      (pairs needs at least two nodes).
+    quiet: true
+
+- name: "Build {{ uat_test }}"
+  ansible.builtin.include_role:
+    name: uat_build
+    tasks_from: test
+  vars:
+    uat_build_prefix: "{{ '%03d' | format(uat_test_counter | int) }}-{{ uat_test }}"
+  when: not uat_aborted | bool
+
+- name: "Decide whether {{ uat_test }} runs"
+  ansible.builtin.set_fact:
+    _uat_skip_reason: >-
+      {{ 'an earlier test aborted the run' if uat_aborted | bool
+         else ('its Go test did not build (' ~ _uat_build_failed | join('; ') ~ ')' if _uat_build_failed | default([]) | length > 0
+         else '') }}
+
+- name: "Lay out sequences for {{ uat_test }}"
+  ansible.builtin.set_fact:
+    _uat_seqs: "{{ [] if _uat_skip_reason | length > 0 else _uat_nodes | uat_sequences(_uat_mode) }}"
+    uat_hosts: "{{ 'uat_none' if _uat_skip_reason | length > 0 else 'uat_' ~ _uat_tid }}"
+    uat_serial: "{{ (_uat_mode in ['serial', 'pairs']) | ternary(1, 0) }}"
+
+- name: "Add a host per sequence of {{ uat_test }}"
+  ansible.builtin.add_host:
+    name: "uat-{{ _uat_tid }}-{{ item.qid }}"
+    groups:
+      - "uat_{{ _uat_tid }}"
+    ansible_connection: local
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    uat_test: "{{ uat_test }}"
+    uat_tid: "{{ _uat_tid }}"
+    uat_test_id: "{{ uat_test_counter | int }}"
+    uat_seq: "{{ item }}"
+    uat_seq_mode: "{{ _uat_mode }}"
+    uat_seq_on_failure: "{{ uat_on_failure }}"
+    uat_seq_timeout: "{{ uat_timeout | default(uat_default_timeout) }}"
+    uat_step_prefix: "{{ '%03d' | format(uat_test_counter | int) }}-{{ uat_test }}{{ ('-' ~ item.label) if item.label else '' }}"
+    uat_run_id: "{{ uat_run_id }}"
+    uat_run_dir: "{{ uat_run_dir }}"
+    uat_storages: "{{ uat_storages }}"
+    uat_builds: "{{ uat_builds }}"
+  loop: "{{ _uat_seqs }}"
+  loop_control:
+    label: "{{ item.qid }} {{ item.nodes | join(' ') }}"
+  changed_when: false
+
+- name: "Record {{ uat_test }}"
+  ansible.builtin.copy:
+    dest: "{{ uat_run_dir }}/tests/{{ _uat_tid }}.json"
+    mode: "0644"
+    content: >-
+      {{ {
+           'tid': _uat_tid,
+           'test_id': uat_test_counter | int,
+           'test': uat_test,
+           'mode': _uat_mode,
+           'on_failure': uat_on_failure,
+           'timeout': uat_timeout | default(uat_default_timeout) | int,
+           'status': 'skipped' if uat_aborted | bool else ('failed' if _uat_skip_reason | length > 0 else 'run'),
+           'reason': _uat_skip_reason | trim,
+           'planned': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ'),
+           'sequences': _uat_seqs
+         } | to_nice_json }}
+
+- name: "Stop the run after {{ uat_test }}, which did not build"
+  ansible.builtin.set_fact:
+    uat_aborted: true
+  when: not uat_aborted | bool and _uat_skip_reason | length > 0 and uat_on_failure == 'abort'

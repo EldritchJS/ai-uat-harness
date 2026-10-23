@@ -1,0 +1,8 @@
+# Assisted by Claude Opus
+galaxy_info:
+  author: AI UAT harness
+  description: Start, failure handling and teardown of one test sequence (one node, node pair, or the project)
+  license: MIT
+  min_ansible_version: "2.16"
+dependencies:
+  - role: uat_config

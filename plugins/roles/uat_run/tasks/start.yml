@@ -1,0 +1,57 @@
+# Assisted by Claude Opus
+- name: Start the run
+  when: not (uat_run_started | default(false))
+  block:
+    - name: Set up the run
+      ansible.builtin.import_tasks: context.yml
+
+    - name: Read provenance
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ role_path }}/files/provenance.py"
+          - "{{ uat_repo_dir }}"
+      register: _uat_provenance
+      changed_when: false
+
+    - name: Write run metadata
+      ansible.builtin.copy:
+        dest: "{{ uat_run_dir }}/meta/run.json"
+        mode: "0644"
+        content: >-
+          {{ {
+               'run_id': uat_run_id,
+               'cluster': uat_cluster_name | default(''),
+               'inventory': ansible_inventory_sources,
+               'command': uat_command_line | default(''),
+               'started': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ'),
+               'namespaces': uat_storages,
+               'managed_by': uat_managed_by,
+               'provenance': _uat_provenance.stdout | from_json
+             } | to_nice_json }}
+
+    - name: Keep a copy of the cluster config
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ uat_run_dir }}/meta/{{ item | basename }}"
+        mode: "0644"
+      loop: "{{ ansible_inventory_sources }}"
+      when: item is file
+
+    - name: Remove objects left by earlier runs
+      ansible.builtin.include_tasks: preflight.yml
+      loop: "{{ uat_storages }}"
+      loop_control:
+        loop_var: uat_store
+        label: "{{ uat_store.namespace }}"
+      when: uat_preflight | bool and not uat_dry_run | bool
+
+    - name: Prepare the builds
+      ansible.builtin.include_role:
+        name: uat_build
+
+    - name: Mark the run started
+      ansible.builtin.set_fact:
+        uat_run_started: true
+        uat_test_counter: 0
+        uat_aborted: false

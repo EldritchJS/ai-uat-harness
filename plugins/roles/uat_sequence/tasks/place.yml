@@ -1,0 +1,41 @@
+# Assisted by Claude Opus
+- name: "Number step {{ step.name }}"
+  ansible.builtin.set_fact:
+    uat_step_counter: "{{ uat_step_counter | int + 1 }}"
+    paramSweep:
+      id: ""
+      command: []
+    _uat_on: "{{ step.nodeIndex | default(0) | int }}"
+    _uat_peer: "{{ step.peer | default(false) | bool }}"
+
+- name: "Check where {{ step.name }} can run"
+  ansible.builtin.assert:
+    that:
+      - not (_uat_peer | bool) or uat_storages | selectattr('role', 'equalto', 'peer') | list | length > 0
+    fail_msg: "{{ step.name }} runs in the peer namespace, but the cluster config sets no uat_peer_namespace"
+    quiet: true
+
+- name: "Place {{ step.name }}"
+  ansible.builtin.set_fact:
+    node: >-
+      {{ uat_seq.nodes[[_uat_on | int, uat_seq.nodes | length - 1] | min] if uat_seq.nodes | length > 0 else '' }}
+    _uat_store: "{{ uat_storages | selectattr('role', 'equalto', 'peer' if _uat_peer | bool else 'project') | first }}"
+    _uat_step_id: "s{{ '%02d' | format(uat_step_counter | int) }}"
+
+- name: "Set the context of {{ step.name }}"
+  ansible.builtin.set_fact:
+    nodeSpec: >-
+      {{ {'name': node, 'componentValidation': hostvars[node].componentValidation | default({})}
+         if node else {} }}
+    namespace: "{{ _uat_store.namespace }}"
+    scratchpad:
+      pvc: "{{ _uat_store.pvc }}"
+      subPath: "{{ _uat_store.basePath }}/{{ uat_run_id }}/scratchpad/{{ uat_step_prefix }}"
+      mountPath: /uat_scratchpad
+    _uat_labels: >-
+      {{ {'app.kubernetes.io/managed-by': uat_managed_by, 'uat/test': uat_test}
+         | combine(uat_seq_labels, {'uat/step': _uat_step_id})
+         | combine({'uat/node': node} if node else {}) }}
+
+- name: Keep the run's log streamer going
+  ansible.builtin.import_tasks: streamer.yml

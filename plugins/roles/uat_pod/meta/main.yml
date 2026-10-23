@@ -1,0 +1,8 @@
+# Assisted by Claude Opus
+galaxy_info:
+  author: AI UAT harness
+  description: Runs one pod step of a test (a long-running server, or a pod per sweep entry) and records it
+  license: MIT
+  min_ansible_version: "2.16"
+dependencies:
+  - role: uat_config

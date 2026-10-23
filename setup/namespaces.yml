@@ -1,0 +1,30 @@
+# Assisted by Claude Opus
+- name: Create the harness namespaces, storage and access
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - uat_config
+  tasks:
+    - name: Check the access settings
+      ansible.builtin.assert:
+        that:
+          - uat_setup.storageClass is defined
+          - (uat_setup.groups | default([]) + uat_setup.users | default([])) | length > 0
+        fail_msg: >-
+          The cluster config needs uat_setup.storageClass and at least one entry in uat_setup.groups
+          or uat_setup.users. Clusters that oac-apps manages have no uat_setup: the uat-harness chart
+          creates these objects there.
+        quiet: true
+
+    - name: List who gets access
+      ansible.builtin.set_fact:
+        _uat_subjects: "{{ uat_setup.groups | default([]) | uat_subjects(uat_setup.users | default([])) }}"
+
+    - name: Apply namespaces, network policies, PVCs, roles and bindings
+      kubernetes.core.k8s:
+        state: present
+        apply: true
+        definition: "{{ item }}"
+      loop: "{{ lookup('ansible.builtin.template', 'templates/namespaces.yaml.j2') | from_yaml_all | select | list }}"
+      loop_control:
+        label: "{{ item.kind }} {{ item.metadata.namespace | default('') }}/{{ item.metadata.name }}"

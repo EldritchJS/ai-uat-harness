@@ -1,928 +1,259 @@
 <!-- Assisted by Claude Opus -->
 # AI UAT Harness
-A declarative test harness that generates Kubernetes manifests from test definitions. Given a cluster configuration (target nodes, namespace, and storage) and a test suite, the generator produces manually-executable manifests and numbered shell scripts that can be run interactively or driven headlessly on OpenShift.
 
-## Table of Contents
+Acceptance tests for AI platforms on OpenShift, written as Ansible playbooks. Each test is a playbook that starts the test's pods and other objects through Red Hat's `kubernetes.core` collection, plus a Ginkgo test that is compiled on the cluster and run inside a pod. A run records everything it did and copies the results back: run metadata, one record per step, a timesheet, pod logs, failure diagnostics, and the JUnit and benchmark output the tests write.
 
-- [How It Works](#how-it-works)
-  - [Generation](#generation)
-  - [Intermediate DAG (steps.json)](#intermediate-dag-stepsjson)
-  - [Execution Flow](#execution-flow)
-  - [Test Scopes](#test-scopes)
-    - [Placement (Cluster Scope)](#placement-cluster-scope)
-  - [PVC Directory Hierarchy](#pvc-directory-hierarchy)
-- [Cluster Setup](#cluster-setup)
-  - [Clusters managed by oac-apps](#clusters-managed-by-oac-apps)
-- [Quickstart](#quickstart)
-  - [Prerequisites](#prerequisites)
-  - [Install](#install)
-  - [Generate Manifests](#generate-manifests)
-  - [CLI Options](#cli-options)
-  - [Run Manually](#run-manually)
-- [Adding a Custom Test](#adding-a-custom-test)
-- [Test Definition Reference](#test-definition-reference)
-  - [DAG Steps](#dag-steps)
-  - [Template Variables](#template-variables)
-  - [Parameter Sweeps](#parameter-sweeps)
-  - [DAG Pods with Services](#dag-pods-with-services)
-  - [Spec Override](#spec-override)
-- [Configuration](#configuration)
-  - [Cluster Config](#cluster-config-clusternameyaml)
-  - [Tool Config](#tool-config-configyaml)
-- [Extensibility](#extensibility)
-- [Admin Usage](#admin-usage)
-- [Project Structure](#project-structure)
+## Layout
 
-
-
-
-## How It Works
-
-The generator reads test definitions (YAML + Go source), a cluster config describing target nodes, and a tool config. It produces its output from an ordered internal step list:
-
-- **Manual output** (`build/manual/`) — numbered shell scripts in execution order, plus a `manifests/` subdirectory with the YAML manifests they reference. Run the scripts in order with `bash`, drive them interactively with `scripts/manual_runner.py`, or run the whole suite headlessly with `scripts/auto_runner.py`.
-
-The output is derived from an ordered step list, so the underlying Kubernetes workloads (pods, services, configmaps) are consistent regardless of how the scripts are driven.
-
-
-```
-Test Definitions (YAML + Go) + Node List → python -m src → Steps → Manual Manifests → OpenShift Execution → Results on PVC
-                                              ↑
-                                       steps.json (optional re-entry point)
-```
-
-### Generation
-
-The generator separates step computation (what to run) from the writer (how to run it). A writer is an independent consumer of the step list, so adding a new execution backend means writing a new writer — step computation doesn't change.
-
-1. **Step computation** — converts test definitions into a flat, ordered list of steps. Each step is either a resource to create (pod manifest, optionally bundled with a service, or an arbitrary Kubernetes resource manifest) or an action to execute (apply a manifest, exec into a pod, delete resources). Ordering is implicit in list position. The writer consumes this step list.
-
-2. **Manual writer** — writes the steps as standalone files to `build/manual/`, organized by phase (setup, test, teardown). Numbered `.sh` scripts in `manual/` are what the operator runs in order. Manifests are written to `manual/manifests/` as data files — each apply script references its manifest via `oc apply -f manifests/<name>.yaml`.
-
-### Intermediate DAG (steps.json)
-
-After step computation and before writing output, the generator serializes the full step list to `build/steps.json`. This file captures the complete DAG — setup, test, and teardown steps — along with the tool and cluster config used to produce them.
-
-The generator can also consume `steps.json` as input via `--steps`, skipping config loading and step computation entirely:
-
-```bash
-# Normal: compute steps from config, write steps.json + manual
-python -m src --test-suite examples/all_tests.yaml --test-lib test_lib --cluster cluster/ocp-test.yaml
-
-# From steps: load steps.json, write manual
-python -m src --steps build/steps.json
-```
-
-This enables a two-phase workflow for custom step injection:
-
-1. Generate `steps.json` from config
-2. Edit the file — add, remove, or reorder steps
-3. Re-run with `--steps` to produce output from the modified DAG
-
-The file is validated on load with Pydantic (field types, metadata structure) and structural checks (unique pod names, source references point to existing generate steps, valid command and probe values, service name DNS-1035 compliance, and failure policy labels).
-
-### Execution Flow
-
-```
-Run order (single ordered step list):
-  Setup:    apply-configmap → create-builder → build
-  Tests:    [tests in test suite list order]
-              node-scoped: parallel per node
-              cluster-scoped: one sequence per node set (sequential)
-              project-scoped: single sequence (no node affinity)
-  Teardown: create-aggregator → aggregate → cleanup  (always runs)
-```
-
-Each test produces one or more step sequences depending on scope: one per node (node-scoped, parallel, pinned via `nodeSelector`), one per node set (cluster-scoped, sequential, pinned via `nodeSelector`), or a single sequence (project-scoped, no `nodeSelector`). All sequences follow the same lifecycle:
-
-```
-Sequence per node:
-  resource:   apply arbitrary K8s resource (e.g. InferencePool)
-  persistent: deploy pod, wait for readiness (stays up)
-  ephemeral:  run test pod → cleanup (per sweep entry, releases resources)
-  after all DAG steps: teardown persistent + resource-step resources
-  finally-teardown: safety-net (always runs)
-```
-
-After each test completes, the runner checks for failures and applies the test's failure policy.
-
-### Test Scopes
-
-Tests are organized into three scopes based on where and how they run:
-
-- **Node** — validates individual nodes in isolation. Each node-scoped test runs independently on every target node listed in the cluster config, pinned via `nodeSelector`. All node sequences execute in parallel. Use for hardware validation, GPU diagnostics, driver checks, and single-node inference benchmarks.
-
-- **Cluster** — validates behavior that spans multiple nodes but still requires node pinning. Cluster-scoped tests use a `placement` config to filter eligible nodes, generate node sets (combinations or permutations), and pin each DAG step to a specific node within the set. Sets run sequentially — each completes fully before the next begins. Use for multi-node coordination tests like distributed training, inter-node networking, or GPU-to-GPU communication across nodes.
-
-- **Project** — validates namespace-level resources with no node affinity. Project-scoped tests run as a single chain without `nodeSelector`, letting the scheduler place pods freely. Use for namespace quota checks, RBAC validation, service mesh configuration, or any test that operates at the project level rather than targeting specific hardware.
-
-Tests are registered in the test suite (see `examples/all_tests.yaml`) as an ordered list, each with a scope and failure policy:
-
-```yaml
-spec:
-  tests:
-    - name: platform-check
-      scope: project
-      onFailure: continue
-
-    - name: component
-      scope: node
-      onFailure: continue
-
-    - name: guidellm
-      scope: node
-      onFailure: abort
-      timeout: 1200
-
-    - name: iperf3
-      scope: cluster
-      onFailure: continue
-```
-
-The `onFailure` field controls what happens when a step within the test fails (default: `continue`):
-- `continue` — all steps run regardless of failures. The runner proceeds to the next test.
-- `skipTest` — remaining steps in the failing test's sequence are skipped (teardown still runs). The runner proceeds to the next test. For node-scoped tests, only the failing node's sequence is skipped; other nodes complete normally.
-- `abort` — remaining steps in the failing test's sequence are skipped, then the runner skips every remaining test and goes straight to teardown/cleanup. For node-scoped tests, only the failing node's sequence is skipped; other nodes complete normally before the run moves on to cleanup.
-
-The optional `timeout` field (integer, seconds) overrides the `defaultTestTimeout` from `config.yaml` for this test's ephemeral pods.
-
-#### Placement (Cluster Scope)
-
-Cluster-scoped tests accept a `placement` config that controls how pods are distributed across nodes:
-
-```yaml
-spec:
-  tests:
-    - name: network
-      scope: cluster
-      onFailure: continue
-      placement:
-        setSize: 2
-        setType: combination
-        setSelection: all
-        setCutoff: 3
-        setRequirements:
-          nvidia.com/gpu: 4
-```
-
-| Field | Default | Description |
-|---|---|---|
-| `setSize` | `1` | Number of distinct nodes per set. When `> 1`, DAG step *i* is pinned to node *i* of the set |
-| `setType` | `combination` | `combination` (unordered, {A,B} = {B,A}) or `permutation` (ordered, (A,B) ≠ (B,A)) |
-| `setSelection` | `random` | `random` picks a single random set; `all` uses every generated set |
-| `setCutoff` | `1` | Limits the number of sets when `setSelection: all`. `0` means no limit |
-| `setRequirements` | `{}` | Filters eligible nodes by `componentValidation.sanity` fields. Numeric fields are minimums, string fields are exact matches |
-
-### PVC Directory Hierarchy
-
-Every DAG step gets a unique directory on the PVC, computed transparently by the generator. Step names encode all hierarchy information (test_id, test name, node, DAG step), so directories are flat under the timestamp. Test pods write to `/uat_workspace` and files land in the right place via `subPath` mounting.
-
-```
-<basePath>/<timestamp>/
-  binaries/
-    <test_name>/test.bin
-  <test_id>-<test>-<node>-<dag_step>/        (node-scoped)
-    junit.xml
-    ...
-  <test_id>-<test>-<set>-<dag_step>/          (cluster-scoped, multiple sets; <set> is a 4-digit index, e.g. 0000)
-    junit.xml
-  <test_id>-<test>-<dag_step>/               (cluster single set / project-scoped)
-    junit.xml
-  report/
-    summary.json
-```
-
-DAG pods also get a second mount at `/binaries` for access to compiled test binaries.
-
-## Cluster Setup
-
-The `setup/` directory contains Kubernetes manifests and scripts for one-time cluster preparation:
-
-- **`user-namespaces-and-pvcs.yaml`** — creates the `uat-project`, `uat-peer`, and `uat-runner` namespaces (each labeled `massopen.cloud/project`), their PVCs, and RBAC. `uat-project` and `uat-peer` each get a 50Gi RWX PVC for test results (`uat-project-storage`, `uat-peer-storage`) and a 100Gi RWX PVC (`uat-models`) for pre-downloaded model weights. `uat-project` also gets two PVCs that are attached to KubeVirt VMs as disks, `uat-project-storage-virt` (50Gi) and `uat-models-virt` (100Gi). Each of the two namespaces gets a namespace-scoped Role + RoleBinding granting the test user access to pods, services, configmaps, and (in `uat-project`) workload APIs (jobs, jobsets, kubeflow, kserve, ray). `uat-runner` gets the runner's workspace and binary PVCs (`uat-runner-storage` 100Gi, `uat-runner-bin` 10Gi) and the `uat-runner-sa` ServiceAccount, which is bound to the test-user Role in the other two namespaces. `uat-project` and `uat-peer` also get a NetworkPolicy that permits same-namespace pod-to-pod traffic plus external egress. It is needed because the cluster's BaselineAdminNetworkPolicy denies tenant traffic by default — including same-namespace east-west — so builds and pod-to-service communication would otherwise fail.
-- **`admin-namespace-and-pvcs.yaml`** — everything for the admin platform checks, kept separate because it needs cluster-admin to apply: the `uat-admin` namespace, a 50Gi RWX PVC for test results (`uat-admin-storage`), a `uat-sa` ServiceAccount, a namespace-scoped admin Role, the same NetworkPolicy the test namespaces get, and a **ClusterRole + ClusterRoleBinding** granting read access to cluster-scoped resources (nodes, deployments, DataScienceClusters, ClusterPolicies, NodeFeatureDiscoveries, ServiceMeshControlPlanes).
-- **`model-downloader.yaml`** — one-shot pods (one per namespace) that download HuggingFace models to the models PVC, and a one-shot VM (`model-downloader-virt` in `uat-project`) that downloads the same models onto the `uat-models-virt` disk and powers off. Add models to the `MODELS` lists and re-run.
-- **`prewarm-images.sh`** — a script that pre-pulls ("warms") every container image used by the test library onto each GPU node in a cluster config, so real test runs don't stall or time out on first-time image pulls. Launches a throwaway pod per (node × image), waits for the pulls to cache, then deletes the pods. Run with `setup/prewarm-images.sh cluster/ocp-test.yaml`.
-- **`auto_runner.yaml`** — the `uat-runner` pod, which clones this repo, runs the build, and drives the whole suite unattended as the `uat-runner-sa` ServiceAccount. Its configuration is the `env` block: `REPO_URL`, `BUILD_CMD`, and an optional `REPO_BRANCH`. Set `REPO_BRANCH` to a branch or tag to run that instead of the default branch, so a change can be tested from a pushed branch before it is merged; leave it empty otherwise.
-
-Apply in order:
-
-```bash
-oc apply -f setup/user-namespaces-and-pvcs.yaml
-# only for the admin platform checks (needs cluster-admin):
-oc apply -f setup/admin-namespace-and-pvcs.yaml
-oc apply -f setup/model-downloader.yaml
-# wait for downloads to complete:
-oc logs -f model-downloader -n uat-project
-oc logs -f model-downloader -n uat-peer
-# once the VM reports Stopped, delete it:
-oc delete vm model-downloader-virt -n uat-project
-# optionally pre-pull test images onto the GPU nodes:
-setup/prewarm-images.sh cluster/ocp-test.yaml
-```
-
-### Clusters managed by oac-apps
-
-On an Open Accelerator cluster where [oac-apps](https://github.com/CCI-MOC/oac-apps) deploys the `uat-harness` chart (currently `oac-dev-workload0`), do not apply `user-namespaces-and-pvcs.yaml`. The chart creates the same resources through ArgoCD, and ArgoCD reverts anything changed by hand. What the chart provides:
-
-- The `uat-project`, `uat-peer`, and `uat-runner` namespaces, with their NetworkPolicies, Roles, RoleBindings, and the `uat-runner-sa` ServiceAccount.
-- The PVCs, under the same names the cluster configs use. Sizes are set in `charts/uat-harness/values.yaml` in oac-apps; to change one, open a pull request there. A PVC can be grown but not shrunk.
-- Access for members of the `project-uat` Keycloak group instead of an individual user. Ask to be added to the group to run tests.
-
-The `uat-admin` namespace and the cluster-scoped RBAC for the admin platform checks are not part of the chart.
-
-Setup on such a cluster is then only the run-time pieces:
-
-```bash
-oc apply -f setup/model-downloader.yaml
-# wait for downloads to complete:
-oc logs -f model-downloader -n uat-project
-oc logs -f model-downloader -n uat-peer
-# once the VM reports Stopped, delete it:
-oc delete vm model-downloader-virt -n uat-project
-# optionally pre-pull test images onto the GPU nodes:
-setup/prewarm-images.sh cluster/oac-dev-workload0.yaml
-```
-
-## Quickstart
-
-### Prerequisites
-
-- Python 3.11+
-- An OpenShift cluster with `oc` configured
-- A PVC with **ReadWriteMany (RWX)** access mode (e.g. CephFS, NFS). Multi-node runs pin pods to different nodes that share one PVC — RWO block storage will fail at scheduling.
-- A separate RWX PVC for model weights, referenced via `storage.models.pvc` in the cluster config (see [Cluster Setup](#cluster-setup))
-- Nodes labeled with `kubernetes.io/hostname`
-- For headless runs: a service account with permissions to create/delete pods, services, and configmaps, and to exec into pods in the target namespace
-
-### Install
-
-```bash
-pip install -r requirements.txt
-```
-
-### Generate Manifests
-
-```bash
-python -m src \
-  --test-suite examples/all_tests.yaml \
-  --test-lib test_lib \
-  --cluster cluster/ocp-test.yaml \
-  --config config.yaml \
-  --templates-dir templates \
-  --scripts-dir scripts
-```
-
-Output is written to `build/manual/`.
-
-### CLI Options
-
-| Flag | Default | Description |
-|---|---|---|
-| `--test-suite` | (required\*) | Path to the test suite YAML |
-| `--test-lib` | (required\*) | Directory containing test definition YAMLs and Go source files |
-| `--cluster` | (required\*) | Path to the cluster config YAML |
-| `--config` | `config.yaml` | Path to the tool config |
-| `--run-id` | `manual-run` | Timestamp substitute for manual output |
-| `--output` | `build` | Output directory |
-| `--templates-dir` | `templates` | Path to Jinja2 templates |
-| `--scripts-dir` | `scripts` | Path to support scripts (e.g. `aggregate.py`) |
-| `--steps` | | Path to a `steps.json` file; skips config loading and step computation |
-
-\* Not required when `--steps` is provided.
-
-### Run Manually
-
-Scripts are numbered in execution order. Run them sequentially:
-
-```bash
-# Run all scripts in order
-for f in build/manual/*.sh; do
-  echo "Running $f"
-  bash "$f"
-done
-```
-
-Or run selectively — setup scripts come first, then test scripts (steps that run in parallel across nodes share the same counter), then teardown scripts at the end:
-
-```bash
-# Setup (first few scripts)
-bash build/manual/01-apply-configmap.sh
-bash build/manual/02-create-builder.sh
-bash build/manual/03-build.sh
-
-# Test scripts follow (numbered 04+)
-# ...
-
-# Teardown (final scripts)
-bash build/manual/N-create-aggregator.sh
-bash build/manual/N-aggregate.sh
-bash build/manual/N-cleanup.sh
-```
-
-#### Interactive Runner (`scripts/manual_runner.py`)
-
-For running a suite interactively rather than script-by-script, `scripts/manual_runner.py` is a curses dashboard over the same `build/` output. It loads `steps.json` and the `manual/*.sh` scripts and presents a full-screen view where you select and run individual lifecycle items (configmap, builds, aggregate, final cleanup) or per-test items, watch each step's status (PENDING / RUNNING / OK / FAILED / SKIPPED), and tail live logs against a running cluster. Steps that share a sequence number run in parallel, and `finally` steps always run last even after a failure. Every run writes timestamped shell and pod logs under `build/logs/`, plus an appended `logs/timesheet.csv` (one row per executed step).
-
-```bash
-python3 scripts/manual_runner.py build
-```
-
-## Adding a Custom Test
-
-Adding a test requires three things: an entry in the test suite, a test definition YAML, and a Ginkgo test file.
-
-### 1. Register the Test
-
-Add the test to your test suite:
-
-```yaml
-spec:
-  tests:
-    - name: component
-      scope: node
-      onFailure: continue
-    - name: guidellm
-      scope: node
-      onFailure: abort
-      timeout: 1200
-    - name: my-test           # add here
-      scope: node
-      onFailure: continue
-```
-
-### 2. Create the Test Definition
-
-Create `test_lib/my-test.yaml`:
-
-```yaml
-apiVersion: uat.openshift.io/v1
-kind: Test
-metadata:
-  name: my-test
-  version: v0.0.1
-  description: Short description of what this test validates
-  supportedScopes:
-    - node
-    - project
-spec:
-  source:
-    ginkgo: my-test.go
-
-  dag:
-    - name: test-runner
-      image: registry.redhat.io/ubi9/ubi:latest
-      labelFilter: pass-fail
-      env:
-        - name: NODE_NAME
-          value: '{{ nodeSpec.name }}'
-      persistsThroughSweep: false
-      parameterSweep: null
-```
-
-### 3. Write the Ginkgo Test
-
-Create `test_lib/my-test.go`:
-
-```go
-package test
-
-import (
-    "testing"
-
-    . "github.com/onsi/ginkgo/v2"
-    . "github.com/onsi/gomega"
-)
-
-func TestMyTest(t *testing.T) {
-    RegisterFailHandler(Fail)
-    RunSpecs(t, "My Test Suite")
-}
-
-var _ = Describe("My Test", Label("pass-fail"), func() {
-    It("should validate something", func() {
-        Expect(true).To(BeTrue())
-    })
-})
-```
-
-The `Label("pass-fail")` must match the `labelFilter` in the test YAML. The compiled binary runs with `--ginkgo.label-filter=pass-fail` to select which specs execute.
-
-### 4. Generate and Run
-
-```bash
-python -m src --test-suite examples/all_tests.yaml --test-lib test_lib --cluster cluster/ocp-test.yaml
-```
-
-The generated output compiles `my-test.go` into a binary on the builder pod and runs it on each target node.
-
-## Test Definition Reference
-
-### Metadata
-
-Each test definition has a `metadata` section that declares properties used by the generator at load time:
-
-| Field | Description |
+| Path | Contents |
 |---|---|
-| `name` | Human-readable test name (informational only) |
-| `supportedScopes` | List of scopes this test supports (`node`, `cluster`, `project`). Defaults to all three when omitted. The generator rejects any suite entry whose `scope` is not in this list. |
+| `tests/` | One playbook (`<test>.yml`) and one Ginkgo test (`<test>.go`) per test, and `batches/` with playbooks that run several tests in order. [`tests/README.md`](tests/README.md) describes each test. |
+| `clusters/` | One Ansible inventory per cluster: the nodes and their expected hardware, the test and peer namespaces, the PVCs, the runner settings and, for a cluster that oac-apps does not manage, the settings for `setup/namespaces.yml`. |
+| `plugins/` | The shared roles every test uses (`roles/`), the filters they need (`filter/`), and the plays that start a run, plan each test, finish a run and drive the runner pod (`playbooks/`). |
+| `setup/` | One-time cluster preparation: namespaces, PVCs and access (for clusters that oac-apps does not manage), model downloads, image pre-pulls. |
+| `build.sh` | Prepares everything: installs the collections, checks the Python library, syntax-checks every playbook and, with `-c`, compiles the Go tests on a cluster. |
+| `deploy.sh` | Runs a batch or a list of tests, from this machine or from a runner pod on the cluster. |
 
-### DAG Steps
+## Requirements
 
-Each test defines an ordered DAG of resources to deploy and run. DAG steps come in two flavors: **pod steps** and **resource steps**. Pod steps are either **persistent** (stay up for all sweep entries) or **ephemeral** (run once per sweep entry and exit). Ephemeral pods are cleaned up immediately after completion to release resources (e.g. GPUs) for subsequent steps. Each ephemeral pod carries a `sweep` label matching its sweep entry ID, enabling targeted deletion without affecting persistent pods. Persistent pods are torn down after all DAG steps complete. **Resource steps** deploy arbitrary Kubernetes resources (e.g. InferencePools, ConfigMaps) as part of the DAG — they declare a `resourceConfig` instead of an image.
+- `ansible-core` 2.16 or newer (tested with 2.18) and the Python `kubernetes` library for the Python that Ansible runs on (Fedora and RHEL: `python3-kubernetes`; pip: `kubernetes`).
+- A login to the cluster (`oc login`), or a pod service account when running in the cluster.
+- In the test namespaces: create, get, list, watch and delete on pods, `pods/log` and services; create and get on `pods/exec`; list on events; and the APIs the tests use (KubeVirt VMs, InferenceServices, Kubeflow TrainJobs), with get on the objects those make (VMIs, JobSets, batch Jobs) so the log streamer can find their pods. The `uat-harness` chart in oac-apps grants these, and on clusters that oac-apps does not manage, `setup/namespaces.yml` does.
 
-| Field | Description |
+## Quick start
+
+```bash
+./build.sh                                     # collections, python check, syntax checks
+./build.sh -c clusters/oac-dev-workload0.yml   # also compile the Go tests on the cluster
+
+./deploy.sh -c clusters/oac-dev-workload0.yml -b tests/batches/no-gpu.yml
+./deploy.sh -c clusters/oac-dev-workload0.yml -t fio,iperf3
+./deploy.sh -c clusters/oac-dev-workload0.yml -t iperf3 -m node -n moc-r4pcc02u05
+./deploy.sh -c clusters/oac-dev-workload0.yml -b tests/batches/all.yml -d   # render only
+./deploy.sh -c clusters/oac-dev-workload0.yml -b tests/batches/no-gpu.yml -p   # from a runner pod
+```
+
+`./deploy.sh -h` lists every option. Anything after `--` is passed to `ansible-playbook`.
+
+A batch can also be run with plain `ansible-playbook -i clusters/<cluster>.yml tests/batches/<batch>.yml`, which is what an Ansible Automation Platform job template would run. `deploy.sh` adds the run id, the log file and the options above.
+
+## How a run works
+
+1. **Start.** Creates `runs/<run-id>/`, records provenance (git commit and dirty state, tool versions, cluster and login), and deletes objects left in the test namespaces by earlier runs (anything labelled `app.kubernetes.io/managed-by=uat-harness`). Objects that are already being deleted are left alone. If harness pods from another run are still Pending or Running in those namespaces, the run stops instead of deleting them; `-- -e uat_preflight_force=true` deletes them anyway.
+2. **Build.** Each test builds its own Go binary when it is planned, so a run builds only its own tests. It is built in each namespace where one of its steps runs the binary (a step with `labelFilter`): `uat-project` for every test today, and `uat-peer` too for ping. The first test that needs a namespace starts a builder pod there, which stays up for the rest of the run and is deleted by the finish play. The builder compiles `tests/<test>.go` onto the namespace's PVC under `<basePath>/builds/<test>/<hash>/`. The hash covers the Go source, the Ginkgo version and the builder image (plus the cluster spec for tests that embed it), so an unchanged test is not rebuilt. A test that does not compile is recorded as failed and none of its pods start; the other tests still run, unless its policy is `abort`.
+3. **Tests.** For each test, a planning play numbers the test, picks its mode and nodes, and adds one in-memory Ansible host per sequence. The test's play then runs once per sequence: in parallel for `node` mode, one at a time for `serial` and `pairs`.
+4. **Finish.** A collector pod in each namespace aggregates the JUnit reports into `report/summary.json` and packs the run's results, which are copied back and unpacked under `runs/<run-id>/results/`. The step records are merged into `steps.json`, `timesheet.csv` and `summary.txt`, and the run fails (non-zero exit) when any step failed, timed out or errored, or a JUnit report has failures.
+
+### Modes
+
+| Mode | Sequences | Runs | Node placement |
+|---|---|---|---|
+| `node` | one per node | in parallel | every step on that node |
+| `serial` | one per node | one after another | every step on that node |
+| `pairs` | one per ordered pair of nodes | one after another | a step goes on the node at its `nodeIndex` (0 or 1) |
+| `project` | one | once | no node selector |
+
+Each test lists the modes it supports in `uat_modes`; the first is the default. `-n` limits the nodes for a run.
+
+### Failure policies
+
+Set per test with `uat_on_failure` (or `-f` for the whole run):
+
+- `continue`: a failed step is recorded and the remaining steps still run.
+- `skipTest`: the rest of that sequence is skipped; teardown still runs; other sequences and tests carry on.
+- `abort`: like `skipTest`, then every later test is skipped and recorded as skipped. Collection and the summary still run.
+
+## What a run records
+
+```
+runs/<run-id>/
+  meta/run.json          run id, cluster, command, provenance, start/finish, final status
+  meta/<cluster>.yml     the cluster config used
+  meta/cluster.yaml      the cluster spec compiled into tests that embed it
+  meta/builds.json       the build hash of each test in the run
+  meta/deploy-vars.json  the options deploy.sh passed
+  ansible.log            the full Ansible output
+  tests/<tid>.json       each test: mode, policy, timeout, sequences and their nodes, or why it was skipped
+  steps/<step>.json      each step: Kubernetes name, namespace, nodes, status, phase, exit code, reason, times, results path
+  logs/<step>/           manifest.yaml (what was applied), <container>.log, diag.yaml (pod status and events on failure),
+                         and for a resource step <pod>.<container>.log for each pod it made (a VM's launcher pod, a job's pods)
+  logs/streamer.log      what the log streamer followed, and when
+  logs/<NNN>-<test>-build-<project|peer>.log   the compile output (with a step record of the same name)
+  logs/collect-*.log, logs/preflight-*.json
+  meta/streams/          the log streamer's heartbeat, a .done file per finished container log, and summary.json
+  results/<project|peer>/  the results directory copied back from each PVC, with report/summary.json
+  steps.json, timesheet.csv, summary.txt
+```
+
+Pod logs are streamed while the run goes, by one process per run (`plugins/roles/uat_run/files/pod_logs.py`). It follows every container of every pod the run creates, and of the pods those objects make, and writes each log byte for byte as it arrives. A dropped stream is resumed without repeating lines, and a restarted container is appended after a `--- <container> restarted ---` line. Each step starts the streamer if it is not running, and waits for a finished pod's logs to be complete before deleting it; the step record says whether they were (`logs_complete`). The finish play stops the streamer.
+
+Kubernetes objects get short names built from IDs: `uat-<tid>-<seq>-<step>[-<sweep>]`, for example `uat-t003-q02-s01-w04` is test 3, sequence 2, step 1, sweep entry 4. The step records map each name to the readable step name used for the log and results directories: `<test id>-<test>-<node or node pair>-<step>[-<sweep entry>]`, for example `003-fio-moc-r4pcc02u05-fio-runner-seq-read-1`. On the PVC, each step writes to `<basePath>/<run-id>/<step name>/`.
+
+## Cluster config
+
+Each file in `clusters/` is an Ansible inventory. The nodes under `uat_nodes` are the nodes tests run on; `componentValidation` holds their expected hardware, which the component test checks and some tests read (for example the GPU count).
+
+```yaml
+all:
+  vars:
+    uat_cluster_name: oac-dev-workload0
+    uat_compliance: {fipsEnabled: false}
+    uat_namespace: uat-project
+    uat_storage: {pvc: uat-project-storage, basePath: uat/results, models: {pvc: uat-models}}
+    uat_peer_namespace: uat-peer
+    uat_peer_storage: {pvc: uat-peer-storage, basePath: uat/results, models: {pvc: uat-models}}
+    uat_runner: {namespace: uat-runner, serviceAccount: uat-runner-sa, pvc: uat-runner-storage}
+  children:
+    uat_nodes:
+      vars: {ansible_connection: local}
+      hosts:
+        moc-r4pcc02u05:
+          componentValidation: {sanity: {...}, ideal: {...}}
+```
+
+The peer and runner settings are optional. A cluster that oac-apps does not manage also needs `uat_setup` for `setup/namespaces.yml`: the storage class, and the groups and users who get access (see `clusters/ocp-test.yml`). On an oac-apps cluster the `uat-harness` chart sets these, so its file has no `uat_setup`. The tool settings in `plugins/roles/uat_config/defaults/main.yml` (images, timeouts, labels) can be overridden in a cluster file, for example `uat_builder_image` for a mirrored registry.
+
+## Writing a test
+
+A test is `tests/<name>.yml` and, when it has Ginkgo steps, `tests/<name>.go`. The playbook has two plays: the planning import, and the test play that runs the steps in order through the shared roles.
+
+```yaml
+- name: Plan mytest
+  ansible.builtin.import_playbook: ../plugins/playbooks/sequences.yml
+  vars:
+    uat_test: mytest          # must match tests/mytest.go
+    uat_modes: [node, serial]
+    uat_on_failure: continue  # optional
+    uat_timeout: 600          # optional, per pod that runs to completion
+
+- name: mytest
+  hosts: "{{ hostvars.localhost.uat_hosts | default('uat_none') }}"
+  serial: "{{ hostvars.localhost.uat_serial | default(0) }}"
+  gather_facts: false
+  vars:
+    serverConfig:
+      model: /models/ibm-granite/granite-3.3-8b-instruct
+  tasks:
+    - name: Start the sequence
+      ansible.builtin.import_role:
+        name: uat_sequence
+
+    - name: Steps
+      block:
+        - name: server
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: server
+              image: nvcr.io/nvidia/vllm:26.03-py3
+              command:
+                args: [python, -m, vllm.entrypoints.openai.api_server]
+                flags: {model: "{{ serverConfig.model }}", port: 8000}
+              service: {enabled: true, port: 8000, name: server, headless: true}
+              readinessProbe: {httpGet: {path: /health, port: 8000}}
+              resources: {requests: {nvidia.com/gpu: "1"}, limits: {nvidia.com/gpu: "1"}}
+              persistsThroughSweep: true
+
+        - name: client
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: client
+              image: registry.redhat.io/ubi9/ubi:9.8
+              labelFilter: pass-fail
+              env:
+                - {name: SERVER_URL, value: '{{ services["server"].url }}'}
+      rescue:
+        - name: Handle the failure
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: failed
+      always:
+        - name: Tear down
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: teardown
+```
+
+Any other Ansible task can go between the steps.
+
+### Adding a test
+
+1. Write `tests/<name>.yml` from the template above, or copy a test with similar steps. `uat_test` must be `<name>`, and `uat_modes` lists the modes the test supports, default first.
+2. If a step runs the Ginkgo binary (`labelFilter`), write `tests/<name>.go`: a Ginkgo v2 suite in `package test` whose specs carry the labels the steps filter on (most tests use `pass-fail` and `quantitative`). The builder compiles it as `test_test.go` in a module of its own with `go mod tidy`, so it can import only the standard library and public modules. The step runs it as `test.bin --ginkgo.label-filter=<labelFilter>` with the step's `env` and `RESULTS_DIR=/uat_workspace`, and its JUnit report goes to `/uat_workspace/junit.xml`. A test that needs the cluster spec embeds it with `//go:embed cluster.yaml`, as `tests/component.go` does.
+3. If a resource step creates a kind that no other test uses, grant it in `uat-user-role` in the test namespace (the `uat-harness` chart in oac-apps, and `setup/templates/namespaces.yaml.j2`), and add it to `uat_cleanup_kinds` in `plugins/roles/uat_config/defaults/main.yml` so preflight deletes what an earlier run left.
+4. Add the test to the batches in `tests/batches/` that should run it, and describe it in `tests/README.md`.
+5. Check it with `./build.sh`, then a dry run (`./deploy.sh -c clusters/<cluster>.yml -t <name> -d`, which records every manifest under `runs/<run-id>/logs/` and creates nothing), then a real run (`./deploy.sh -c clusters/<cluster>.yml -t <name>`). A run compiles each test when it plans it; `./build.sh -c clusters/<cluster>.yml` compiles every test ahead of time.
+
+### Pod steps (`uat_pod`)
+
+| Key | Meaning |
 |---|---|
-| `name` | Step name, used in pod/resource naming and directory hierarchy |
-| `image` | Container image (required for pod steps, omitted for resource steps) |
-| `persistsThroughSweep` | `true`: pod stays up (e.g. inference server). `false`: pod runs to completion. Pod steps only |
-| `labelFilter` | Ginkgo label filter for the compiled binary |
-| `command` | Structured command with `args` and `flags` |
-| `parameterSweep` | If set, one pod per entry with merged flags. Pod steps only |
-| `service` | Service configuration block (see [DAG Pods with Services](#dag-pods-with-services)). Fields: `enabled` (bool, default `false`), `name` (string, used in `services["name"]` template lookups), `port` (int, default `8000`), `headless` (bool, default `true` — sets `clusterIP: None`) |
-| `env` | Environment variables. Each entry has either a `value` (Jinja2 template) or a `valueFrom` (passed through as-is — supports `fieldRef`, `secretKeyRef`, `configMapKeyRef`) |
-| `resources` | CPU/GPU/memory requests and limits |
-| `readinessProbe` | Readiness probe for persistent pods |
-| `ports` | Container ports |
-| `privileged` | If `true`, runs with `securityContext.privileged` and `hostPID` |
-| `volumeMounts` | Additional volume mounts (beyond the PVC) |
-| `volumes` | Additional volume definitions |
-| `labels` | Custom labels added to pod metadata (dict of key-value strings) |
-| `sidecars` | List of sidecar containers. Rendered as `initContainers` with `restartPolicy: Always` (native K8s sidecar pattern). Each sidecar has `name`, `image`, `command`, `args`, `env`, `ports`, `resources`, `volumeMounts` |
-| `resourceConfig` | Deploys an arbitrary K8s resource instead of a pod. Contains `apiVersion`, `kind`, `spec` (dict with Jinja2-rendered values), and an optional `annotations` map (rendered onto the resource's `metadata.annotations`). Mutually exclusive with `persistsThroughSweep`, `parameterSweep`, and `sidecars` |
-| `serviceAccountName` | Service account for the generated pod |
-| `peer` | If `true`, this step runs in the peer namespace instead of the default namespace |
+| `name`, `image` | Step name (also the container name) and image. Required. |
+| `labelFilter` | Run the test's Ginkgo binary with this label filter; JUnit goes to `/uat_workspace/junit.xml` and `RESULTS_DIR=/uat_workspace` is set. |
+| `command` | `args` plus `flags`, rendered as `--key=value` (`--key` for a null value). Used when there is no `labelFilter`. |
+| `parameterSweep` | `baseCommand` (`args`, `flags`) and `entries` (`id`, `description`, `flags` merged over the base flags). One pod per entry, run one after another; `paramSweep.command` holds the entry's command. |
+| `persistsThroughSweep` | `true` for a long-running pod: the step waits until it is Ready, and it stays up until the sequence's teardown. Otherwise the step waits for the pod to finish and then deletes it. |
+| `service` | `enabled`, `port`, `name`, `headless`. Registers `services[name]` with `name`, `url` and `port` for later steps. |
+| `peer` | Run in the peer namespace, with the peer PVC. |
+| `nodeIndex` | Which node of a `pairs` sequence the step runs on (default 0). |
+| `env`, `ports`, `readinessProbe`, `resources`, `volumes`, `volumeMounts`, `sidecars`, `labels`, `privileged`, `serviceAccountName`, `timeout` | Passed to the pod; `sidecars` become native sidecar init containers; `timeout` overrides the test's timeout for this step. |
 
-### Template Variables
+Every pod mounts its own results directory at `/uat_workspace`, the test binaries at `/binaries`, the sequence's shared scratch directory at `/uat_scratchpad`, and the models PVC read-only at `/models`.
 
-Available in `command`, `env`, and `resources` values via Jinja2:
+### Resource steps (`uat_resource`)
 
-| Variable | Description |
+`resourceConfig` with `apiVersion`, `kind`, `spec` and optional `annotations` creates any other object (a VirtualMachine, a Service, an InferenceService, a training job). It gets the harness labels, `resource_name` is set to its name, and the sequence teardown deletes it. The logs of the pods it makes are streamed too (see "What a run records"): pods it owns directly or through up to two other objects (a VM's launcher pod through its VMI, a TrainJob's pods through their Job and its JobSet), and pods that carry its labels (an InferenceService's predictor, if KServe copies its labels).
+
+### Variables in step definitions
+
+Step values are Jinja templates, filled in when the step runs:
+
+| Variable | Value |
 |---|---|
-| `nodeSpec.*` | Full node spec from cluster config (e.g. `{{ nodeSpec.componentValidation.sanity["nvidia.com/gpu"] }}`) |
-| `serverConfig.*` | Test-level config dict (e.g. `{{ serverConfig.model }}`) |
-| `services["name"].url` | URL of a DAG step's service. Also available: `.name` (Kubernetes service name), `.port` (port number) |
-| `paramSweep.id` | Current sweep entry ID |
-| `paramSweep.command` | Resolved command list for the current sweep entry |
-| `timestamp` | Run identifier (`__TIMESTAMP__` placeholder) |
-| `node` | Target node name |
-| `resource_name` | The current step's Kubernetes `metadata.name` (from `build_resource_name()`). Available in `resourceConfig` step values (e.g. to make a resource reference itself) |
-| `namespace` | Target Kubernetes namespace |
+| `serverConfig` | The test play's own settings. |
+| `nodeSpec` | The step's node from the cluster config: `name` and `componentValidation`. |
+| `node`, `namespace` | The step's node name ('' in project mode) and namespace. |
+| `services` | Services registered by earlier steps of the sequence. |
+| `resource_name`, `resources` | The latest resource step's name, and every resource step by step name. |
+| `paramSweep` | The current sweep entry: `id` and `command`. |
+| `scratchpad` | `pvc`, `subPath` and `mountPath` of the sequence's scratch directory, for resource steps to mount. |
+| `uat_*` | Run settings, for example `uat_namespace`, `uat_peer_namespace`, `uat_managed_by`. |
 
-### Parameter Sweeps
+## Batches
 
-A sweep runs the same test pod multiple times with different flags. Define a `baseCommand` and a list of `entries`:
-
-```yaml
-parameterSweep:
-  baseCommand:
-    args: [guidellm, benchmark, run]
-    flags:
-      target: '{{ services["vllm-server"].url }}'
-      output-dir: /uat_workspace
-      max-seconds: 120
-  entries:
-    - id: short-burst
-      description: Short high-rate burst
-      flags:
-        max-seconds: 30
-        rate: 4
-    - id: sustained-load
-      description: Sustained moderate-rate
-```
-
-Each entry's `flags` are merged over `baseCommand.flags`. One pod is created per entry.
-
-### DAG Pods with Services
-
-Any DAG step — persistent or ephemeral — can have a Service. The most common use is a persistent pod (e.g. an inference server) that test pods connect to:
+A batch is a playbook of `import_playbook` lines in run order, ending with the finish play. Values set on an import override the test's defaults for that entry, and the same test can appear more than once.
 
 ```yaml
-dag:
-  - name: vllm-server
-    image: nvcr.io/nvidia/vllm:26.03-py3
-    persistsThroughSweep: true
-    service:
-      enabled: true
-      port: 8000
-      name: vllm-server
-      headless: true
-    command:
-      args: [python, -m, vllm.entrypoints.openai.api_server]
-      flags:
-        model: ibm-granite/granite-3.3-8b-instruct
-        port: 8000
-    readinessProbe:
-      httpGet:
-        path: /health
-        port: 8000
-      initialDelaySeconds: 30
-      periodSeconds: 10
+- name: fio
+  ansible.builtin.import_playbook: ../fio.yml
+  vars:
+    uat_mode: serial
 
-  - name: my-test
-    image: my-test-image:latest
-    persistsThroughSweep: false
-    env:
-      - name: SERVER_URL
-        value: '{{ services["vllm-server"].url }}'
+- name: iperf3
+  ansible.builtin.import_playbook: ../iperf3.yml
+
+- name: Finish
+  ansible.builtin.import_playbook: ../../plugins/playbooks/finish.yml
 ```
 
-The generator creates a Kubernetes Service alongside the pod. Downstream steps reference it via `{{ services["vllm-server"].url }}`, which resolves to `http://<service_name>:8000`. The service's `metadata.name` is generated by `build_resource_name()` with the `svc` type code — a fixed-width, DNS-1035-valid name like `ua-002-svc-vllm-server------wrk-4--------------------t` (see [ARCHITECTURE.md](ARCHITECTURE.md#generation) for the naming scheme). By default, services are headless (`clusterIP: None`) — traffic routes directly to the pod IP without kube-proxy load balancing. Set `headless: false` to create a standard ClusterIP service instead.
+`deploy.sh -t a,b` runs tests without a batch, each with its defaults.
 
-### Spec Override
-
-Each suite entry can include a `spec` section that is deep-merged over the test definition's `spec` from `<test>.yaml`. This lets the same test definition produce different runtime configurations across suite entries without duplicating the test file:
-
-```yaml
-spec:
-  tests:
-    - name: guidellm
-      scope: node
-      onFailure: abort
-      spec:
-        serverConfig:
-          model: ibm-granite/granite-3.3-8b-instruct
-        dag:
-          vllm-server:
-            resources:
-              limits:
-                nvidia.com/gpu: 2
-```
-
-The merge is recursive for dict fields (`serverConfig`, `requirements`) — nested keys are merged, not replaced. For `dag` overrides, steps are referenced by name as dict keys (not a list): each key is matched to a DAG step by `name`, and only the specified fields within that step are overridden. Unmentioned fields and unmentioned DAG steps retain their `<test>.yaml` defaults. After merging, the result is re-validated as a `TestSpec`.
-
-## Configuration
-
-### Cluster Config (`cluster/<name>.yaml`)
-
-Defines target nodes, namespace, storage, and optional peer namespace for cross-namespace tests:
-
-```yaml
-spec:
-  compliance:
-    fipsEnabled: true
-
-  nodes:
-    - name: wrk-4
-      componentValidation:
-        sanity:
-          nvidia.com/gpu: 4
-          resourceNames:
-            nvidia.com/gpu: NVIDIA-A100-SXM4-40GB
-          # ... additional fields available as {{ nodeSpec.componentValidation.* }}
-  namespace: my-namespace
-  peerNamespace: my-peer-namespace
-  storage:
-    pvc: my-pvc
-    basePath: uat/results
-    models:
-      pvc: my-models-pvc     # optional: mounted read-only at /models on all DAG pods
-  peerStorage:               # optional: defaults to storage when omitted
-    pvc: my-peer-pvc
-    basePath: uat/results
-    models:
-      pvc: my-models-pvc
-```
-
-The `compliance` section holds cluster-wide settings consumed by Go test binaries (e.g., the FIPS mode check in the component test). The harness passes these through via the embedded `cluster.yaml` — they are not used by the manifest generator.
-
-The optional `storage.models` section configures a separate volume for pre-downloaded model weights. When `models.pvc` is set, every DAG pod (both persistent and ephemeral) gets a read-only mount at `/models`. This decouples model storage from the results PVC and lets inference servers load weights from a shared cache (e.g. `--model /models/ibm-granite/granite-3.3-8b-instruct`) instead of downloading at runtime. When omitted, no models volume is mounted. `ModelsStorageConfig` is its own model so the backing store can be extended beyond PVC (e.g. to object storage or a CSI-based mount) without changing the rest of the storage config.
-
-The `peerNamespace` field names a second namespace for cross-namespace tests. DAG steps with `peer: true` deploy to this namespace. When present, the generator creates independent infrastructure (ConfigMap, builder pod, aggregator pod) in the peer namespace. The optional `peerStorage` section configures the peer namespace's PVC, base path, and models volume; when omitted, the primary `storage` config is used for both namespaces.
-
-The `name` field is the value matched against the `nodeSelectorKey` label (default: `kubernetes.io/hostname`). It is also used in step names for human readability. For Kubernetes resource names (pods, services), the node name becomes the fixed-width `<node>` field of `build_resource_name()` via `fit(node, 10)`: it is lowercased and sanitized (invalid characters replaced with dashes), and if the result exceeds 10 characters it is truncated to 5 characters with a 4-character hash suffix. Short, simple names like `wrk-4` are used as-is; FQDN hostnames like `ip-10-0-1-42.ec2.internal` are automatically shortened.
-
-All fields under `componentValidation` are available in Jinja2 templates. Resource keys in the sanity dict use actual Kubernetes resource names (e.g. `nvidia.com/gpu`, `cpu`, `memory`) so they match resource requests in DAG steps directly. The `resourceNames` sub-dict maps resource keys to hardware model names for component validation.
-
-### Tool Config (`config.yaml`)
-
-Controls images, pod names, labels, and timeouts:
-
-```yaml
-oseCLIImage: registry.redhat.io/openshift4/ose-cli:latest
-builderImage: golang:1.26
-ginkgoVersion: v2.32.0
-aggregatorImage: python:3-slim
-configmapName: uat-test-source
-builderPodName: ginkgo-builder
-aggregatorPodName: uat-aggregator
-nodeSelectorKey: kubernetes.io/hostname
-managedByLabel: uat-generator
-builderTimeout: 300
-aggregatorTimeout: 120
-deployTimeout: 600
-defaultTestTimeout: 600
-```
-
-All timeout values are integers in seconds.
-
-## Extensibility
-
-### Per-Test Timeout and Failure Policy
-
-Each test in the test suite can override the default timeout and declare its own failure policy. Tests can be listed in any order and the same test can appear multiple times with different settings:
-
-```yaml
-spec:
-  tests:
-    - name: guidellm
-      scope: node
-      onFailure: abort
-      timeout: 1200        # override defaultTestTimeout from config.yaml
-
-    - name: guidellm         # same test, different policy
-      scope: node
-      onFailure: continue
-      timeout: 3600
-```
-
-### Custom Step Injection (steps.json)
-
-The generator writes an intermediate `steps.json` after step computation. You can edit this file — add, remove, or reorder steps — then re-run with `--steps` to produce output from the modified step list. See [Intermediate DAG](#intermediate-dag-stepsjson) for details.
-
-### Custom Node Attributes
-
-The `componentValidation` section in cluster configs accepts arbitrary fields via Pydantic's `extra="allow"`. Any field you add is available in Jinja2 templates as `{{ nodeSpec.componentValidation.* }}` — no code changes needed.
-
-```yaml
-# cluster/my-cluster.yaml
-spec:
-  nodes:
-    - name: wrk-4
-      componentValidation:
-        sanity:
-          nvidia.com/gpu: 4
-          cpu: 128
-          memory: 1007Gi
-          resourceNames:
-            nvidia.com/gpu: NVIDIA-A100-SXM4-40GB
-            cpu: Intel(R) Xeon(R) Platinum 8358
-          nvlink: NV4                          # custom field
-```
-
-Use these in test definitions for resource requests, environment variables, or command flags:
-
-```yaml
-resources:
-  limits:
-    nvidia.com/gpu: '{{ nodeSpec.componentValidation.sanity["nvidia.com/gpu"] }}'
-env:
-  - name: GPU_MODEL
-    value: '{{ nodeSpec.componentValidation.sanity.resourceNames["nvidia.com/gpu"] }}'
-```
-
-### Server Config
-
-The `serverConfig` dict in test definitions passes arbitrary key-value pairs into the template context. Use it for test-specific configuration that varies between deployments:
-
-```yaml
-# test definition
-spec:
-  serverConfig:
-    model: ibm-granite/granite-3.3-8b-instruct
-    maxTokens: 4096
-  dag:
-    - name: server
-      command:
-        flags:
-          model: '{{ serverConfig.model }}'
-```
-
-### Resource Steps (Arbitrary K8s Resources)
-
-DAG steps can deploy arbitrary Kubernetes resources (not just pods) by using `resourceConfig` instead of `image`. This is useful for deploying InferencePools, ConfigMaps, or any CRD as part of the test DAG:
-
-```yaml
-dag:
-  - name: inference-pool
-    resourceConfig:
-      apiVersion: inference.networking.k8s.io/v1
-      kind: InferencePool
-      spec:
-        selector:
-          matchLabels:
-            llm-d.ai/role: prefill
-        targetPortNumber: 8000
-```
-
-Resource steps are applied with `oc apply` and the resource type (e.g. `InferencePool`) is automatically added to the teardown resource type list so cleanup catches them. The `spec` values support Jinja2 templates (e.g. `{{ services["epp"].url }}`), and `resource_name` resolves to the resource's own `metadata.name`. An optional `annotations` map is rendered onto the resource's `metadata.annotations` — the kserve test uses this to set `serving.kserve.io/deploymentMode: RawDeployment` on its InferenceService. Resource steps cannot use `persistsThroughSweep`, `parameterSweep`, or `sidecars`.
-
-### Sidecar Containers
-
-Pod DAG steps can include sidecar containers that run alongside the main container. Sidecars are rendered as Kubernetes native sidecar init containers (`restartPolicy: Always`):
-
-```yaml
-dag:
-  - name: vllm-server
-    image: nvcr.io/nvidia/vllm:26.03-py3
-    persistsThroughSweep: true
-    sidecars:
-      - name: routing-proxy
-        image: ghcr.io/llm-d/sidecar:main
-        args: ["--port=8000", "--vllm-port=8200"]
-        ports:
-          - containerPort: 8000
-        env:
-          - name: POD_IP
-            valueFrom:
-              fieldRef:
-                fieldPath: status.podIP
-```
-
-Sidecar `env`, `args`, `command`, and `resources` values are rendered through Jinja2 (e.g. `--tp={{ nodeSpec.componentValidation.sanity['nvidia.com/gpu'] }}`).
-
-### Environment Variables with valueFrom
-
-Env vars support both plain `value` (Jinja2 template) and Kubernetes `valueFrom` references. Use `valueFrom` to inject pod metadata or secret values:
-
-```yaml
-env:
-  - name: POD_IP
-    valueFrom:
-      fieldRef:
-        fieldPath: status.podIP
-  - name: HF_TOKEN
-    valueFrom:
-      secretKeyRef:
-        name: llm-d-hf-token
-        key: HF_TOKEN
-  - name: MODEL
-    value: '{{ serverConfig.model }}'
-```
-
-### Service Account and Custom Labels
-
-DAG steps can specify a `serviceAccountName` and custom `labels`:
-
-```yaml
-dag:
-  - name: vllm-server
-    image: nvcr.io/nvidia/vllm:26.03-py3
-    serviceAccountName: my-service-account
-    labels:
-      llm-d.ai/role: prefill
-      app: vllm
-```
-
-### Arbitrary Kubernetes Configuration in DAG Steps
-
-DAG steps accept arbitrary dicts for `volumeMounts`, `volumes`, `env`, `ports`, `resources`, and `readinessProbe`. These map directly to Kubernetes pod spec fields, so you can mount secrets, define custom probes, or request specialized hardware without modifying the generator:
-
-```yaml
-dag:
-  - name: my-step
-    volumeMounts:
-      - name: model-cache
-        mountPath: /models
-    volumes:
-      - name: model-cache
-        hostPath:
-          path: /mnt/models
-    readinessProbe:
-      exec:
-        command: [cat, /tmp/ready]
-```
-
-### Custom Templates
-
-The `--templates-dir` CLI arg loads all Jinja2 templates from a custom directory. Copy the default `templates/` directory and modify any template to change the generated manifests — for example, to target a different Kubernetes distribution, add custom annotations, or change the pod structure.
+## Cluster setup
 
 ```bash
-cp -r templates/ my-templates/
-# edit my-templates/dag-pod.yaml.j2 to add custom annotations
-python -m src --templates-dir my-templates/ --test-suite examples/all_tests.yaml --test-lib test_lib --cluster cluster/ocp-test.yaml
+ansible-playbook -i clusters/<cluster>.yml setup/namespaces.yml --check --diff   # compare
+ansible-playbook -i clusters/<cluster>.yml setup/namespaces.yml                  # needs cluster-admin
+ansible-playbook -i clusters/<cluster>.yml setup/models.yml                      # downloads the models
+ansible-playbook -i clusters/<cluster>.yml setup/prewarm-images.yml              # optional
 ```
 
-### Custom Aggregation
+- `namespaces.yml` is for clusters that oac-apps does not manage. It creates the test, peer and runner namespaces, their NetworkPolicies, the PVCs, the Roles and RoleBindings for the groups and users in `uat_setup`, and the runner service account. On an oac-apps cluster such as oac-dev-workload0 the `uat-harness` chart creates these objects, and the cluster file has no `uat_setup`, so the playbook stops at its first check.
+- `models.yml` downloads `uat_models` onto the models PVC in each namespace with a pod, and onto the VM disk PVC (`uat-models-virt`) with a VM that powers off when done.
+- `prewarm-images.yml` starts a pod per node and image so each node pulls the images the tests use, reports any that did not pull, and deletes the pods. `-e '{"uat_prewarm_images": [...]}'` limits the images.
 
-The `--scripts-dir` CLI arg controls where `aggregate.py` is loaded from. Replace it with a custom script that aggregates into different formats (HTML, database, metrics endpoint) or applies custom filtering:
+## Running in the cluster
 
-```bash
-cp -r scripts/ my-scripts/
-# edit my-scripts/aggregate.py to push results to a dashboard
-python -m src --scripts-dir my-scripts/ --test-suite examples/all_tests.yaml --test-lib test_lib --cluster cluster/ocp-test.yaml
-```
-
-The script receives the results directory as its first argument and is expected to scan for `junit.xml` files across all step directories.
-
-### Tool Configuration
-
-All images, pod names, labels, and timeouts are configurable via `config.yaml`. Change the Go builder image, use a custom aggregator, adjust timeouts per workload, or change the node selector key for non-standard label schemes:
-
-```yaml
-builderImage: my-registry/go-builder:1.25   # custom builder with extra tools
-nodeSelectorKey: my.org/node-role            # custom label key
-deployTimeout: 1200                           # longer timeout for slow infrastructure
-```
-
-### Manifest Validation
-
-`validate_manifest()` in `common.py` checks structural minimums (YAML syntax, required fields). It can be extended with schema validation, dry-run checks, or policy enforcement (image registry allowlists, resource limit requirements) by adding checks to this function.
-
-### Additional Output Layers
-
-The compute/write architecture is designed for extension. Step computation produces a flat list of steps that any writer can consume. A new writer could generate Argo Workflows, GitHub Actions, or Helm charts by reading the same step list and substituting `__TIMESTAMP__` with the appropriate runtime expression.
-
-## Admin Usage
-
-Administrators can create a dedicated test suite with privileged tests for low-level node diagnostics — GPU register checks, PCIe topology inspection, driver-level validation, or anything else that requires host-level access.
-
-### Setting Up a Privileged Test Suite
-
-Create a separate suite directory (e.g. `admin-suite/`) with its own `test_suite.yaml` and test definitions. Set `privileged: true` on DAG steps that need host access:
-
-```yaml
-# admin-suite/gpu-diag.yaml
-apiVersion: uat.openshift.io/v1
-kind: Test
-metadata:
-  name: gpu-diag
-  version: v0.0.1
-  description: Low-level GPU diagnostics requiring host access
-spec:
-  source:
-    ginkgo: gpu-diag.go
-  dag:
-    - name: diag-runner
-      image: nvcr.io/nvidia/cuda:12.8.0-devel-ubi9
-      labelFilter: diagnostics
-      privileged: true
-      env:
-        - name: NODE_NAME
-          value: '{{ nodeSpec.name }}'
-      persistsThroughSweep: false
-      parameterSweep: null
-```
-
-When `privileged: true` is set, the generated pod spec includes `securityContext.privileged: true` and `hostPID: true`, giving the container full host-level access.
-
-### Generating and Running Manually
-
-Use manual mode to generate manifests for the privileged suite, then run them step by step:
-
-```bash
-# Generate only the admin suite
-python -m src \
-  --test-suite admin-suite/test_suite.yaml \
-  --test-lib admin-suite \
-  --cluster cluster/ocp-test.yaml \
-  --config config.yaml \
-  --run-id admin-$(date +%Y%m%d-%H%M%S)
-
-# Run all scripts in order
-for f in build/manual/*.sh; do bash "$f"; done
-```
-
-Manual mode gives the administrator control over which nodes to target and the ability to inspect results between steps. The privileged pods require a namespace with appropriate SecurityContextConstraints (e.g. `privileged` SCC on OpenShift).
-
-## Project Structure
-
-```
-src/
-  __main__.py         Entry point
-  main.py             CLI parsing, orchestration
-  step_generator.py   Setup/teardown step computation, step I/O (steps.json)
-  node.py             Node-level step computation, DAG pod rendering
-  cluster.py          Cluster-level step computation, placement resolution
-  project.py          Project-level step computation (single chain, no node affinity)
-  common.py           Jinja2 engine, manifest validation, resource step rendering
-  models.py           Pydantic schemas and dataclasses
-  writers/
-    manual.py         Manual writer (numbered shell scripts + YAML manifests)
-tests/                Unit and integration tests
-scripts/
-  aggregate.py        JUnit XML aggregation (deployed via ConfigMap)
-  manual_runner.py    Curses dashboard for running a suite interactively from build/
-  auto_runner.py      Headless driver that runs a suite unattended from build/
-setup/
-  user-namespaces-and-pvcs.yaml   Namespaces (uat-project, uat-peer, uat-runner), PVCs, RBAC, and NetworkPolicies
-  admin-namespace-and-pvcs.yaml   Admin namespace (uat-admin), PVC, NetworkPolicy, and cluster-scoped RBAC
-  model-downloader.yaml           Pods to download models to PVCs
-  prewarm-images.sh               Pre-pulls test-library images onto each GPU node
-  auto_runner.yaml                Pod that runs a suite unattended (the uat-runner)
-templates/
-  *.yaml.j2           Jinja2 templates for Kubernetes manifests
-  resource.yaml.j2    Generic template for arbitrary K8s resources (resource steps)
-  *.sh.j2             Jinja2 templates for shell scripts
-examples/
-  all_tests.yaml      Test suite (test execution order, scopes, failure policies)
-  <test>.yaml         One suite per test, for running a single test on its own
-test_lib/             Test library (test definitions, Go source)
-cluster/              Cluster configs
-config.yaml           Tool config
-conftest.py           Adds project root to sys.path for pytest
-requirements.txt      Python dependencies
-```
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for design decisions and [IMPLEMENTATION.md](IMPLEMENTATION.md) for implementation details.
-
-## Why ConfigMaps
-
-The generator delivers Go source, build scripts, cluster config, test suite config, and the aggregation script to the builder pod via a Kubernetes ConfigMap. The `go.mod` is generated at build time from the Ginkgo version pinned in `config.yaml`, so test authors only need to provide a `.go` source file. An alternative approach — using a setup pod that clones Git repos directly onto the PVC — was explored and rejected due to the following challenges:
-
-- **Cluster config consistency.** The cluster YAML contains sensitive, environment-specific details (node names, GPU counts, namespace, storage config). With Git clones, the cluster config must either live in a public repo (security risk) or on a separate PVC (adding a `clusterConfigSource`/`clusterConfigPvc` configuration surface). The ConfigMap approach uses the same local file the generator already reads, guaranteeing the cluster config in the pod matches what the generator used to compute the DAG.
-
-- **Test suite consistency.** The generator reads test definitions locally (`--test-suite` / `--test-lib`) to compute the step DAG — which pods to create, what commands to run, what sweep entries to generate. A setup pod would clone the test suite from a remote repo at runtime. If the local directory and the remote repo diverge (different branch, uncommitted changes, different path), the DAG won't match the compiled binaries: steps may reference tests that don't exist on the PVC, or miss tests that do. The ConfigMap eliminates this class of drift by bundling exactly the source the generator consumed.
-
-- **Additional infrastructure.** The setup pod approach requires a Python image, network access to clone repos, `pip install` of dependencies, and a standalone `builder.py` script that duplicates test-suite parsing logic already in the generator. The ConfigMap approach has no runtime dependencies beyond `oc` and the Go toolchain.
-
-The ConfigMap approach has a **1MB size limit** (Kubernetes hard constraint). This is sufficient for the current test suite but may become a bottleneck if the number of tests grows significantly. If the limit is hit, the recommended mitigation is to split tests across multiple suite directories and run them as separate runs, or to revisit the Git clone approach with a mechanism to pin the exact commit the generator ran against.
+`deploy.sh -p` starts a runner pod in `uat_runner.namespace` as `uat_runner.serviceAccount` and copies this checkout into it (or, with `-g URL [-G REF]`, the pod clones that repository). The pod installs ansible-core, the Python `kubernetes` library and the collections, then runs the same `deploy.sh` with the run directory on `uat_runner.pvc`. By default `deploy.sh` waits, saves the runner log, copies the run directory back to `runs/<run-id>/` and deletes the pod. With `-k` it returns right away; `deploy.sh -c <cluster> -F <run-id>` copies the run back later.

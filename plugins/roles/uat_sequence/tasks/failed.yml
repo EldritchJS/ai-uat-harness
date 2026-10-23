@@ -1,0 +1,35 @@
+# Assisted by Claude Opus
+- name: "Mark sequence {{ uat_seq.qid }} failed"
+  ansible.builtin.set_fact:
+    uat_seq_failed: true
+
+- name: Record the error that stopped the sequence
+  ansible.builtin.copy:
+    dest: "{{ uat_run_dir }}/steps/{{ uat_step_prefix }}-error-{{ uat_step_counter }}.json"
+    mode: "0644"
+    content: >-
+      {{ {
+           'run': uat_run_id,
+           'tid': uat_tid,
+           'test_id': uat_test_id | int,
+           'test': uat_test,
+           'mode': uat_seq_mode,
+           'sequence': uat_seq.qid,
+           'nodes': uat_seq.nodes,
+           'dir': uat_step_prefix ~ '-error-' ~ uat_step_counter,
+           'step': ansible_failed_task.name | default(''),
+           'kind': 'Error',
+           'status': 'error',
+           'reason': ansible_failed_result.msg | default('') | string | truncate(500),
+           'started': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ'),
+           'finished': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ'),
+           'duration_s': 0
+         } | to_nice_json }}
+  when: not (ansible_failed_task.name | default('')).startswith('Stop after')
+
+- name: Stop the run after this test
+  ansible.builtin.set_fact:
+    uat_aborted: true
+  delegate_to: localhost
+  delegate_facts: true
+  when: uat_seq_on_failure == 'abort'

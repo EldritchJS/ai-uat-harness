@@ -1,0 +1,54 @@
+# Assisted by Claude Opus
+- name: Keep the run's log streamer going
+  ansible.builtin.import_role:
+    name: uat_sequence
+    tasks_from: streamer
+
+- name: "Wait for the log streams of {{ _uat_dir }} to end"
+  ansible.builtin.set_fact:
+    _uat_streams_left: >-
+      {{ (((_uat_obj.status | default({})).initContainerStatuses | default([]))
+          + ((_uat_obj.status | default({})).containerStatuses | default([])))
+         | selectattr('state.terminated', 'defined') | map(attribute='name')
+         | reject('in', query('ansible.builtin.fileglob', uat_run_dir ~ '/meta/streams/' ~ _uat_name ~ '.*.done')
+                        | map('basename') | map('replace', _uat_name ~ '.', '', 1) | map('replace', '.done', '') | list)
+         | list }}
+  register: _uat_streams
+  until: _uat_streams.ansible_facts._uat_streams_left | length == 0
+  retries: 30
+  delay: 2
+  failed_when: false
+
+- name: "Note whether the logs of {{ _uat_dir }} are complete"
+  ansible.builtin.set_fact:
+    _uat_logs_complete: "{{ _uat_streams_left | length == 0 }}"
+
+- name: "Describe {{ _uat_dir }} after {{ _uat_status }}"
+  when: _uat_status in ['failed', 'timeout', 'error']
+  block:
+    - name: Read the pod events
+      kubernetes.core.k8s_info:
+        kind: Event
+        namespace: "{{ namespace }}"
+        field_selectors: >-
+          {{ ['involvedObject.name=' ~ _uat_name]
+             + (['involvedObject.uid=' ~ _uat_obj.metadata.uid] if (_uat_obj | default({})).metadata.uid is defined else []) }}
+      register: _uat_events
+      failed_when: false
+
+    - name: Save the diagnostics
+      ansible.builtin.copy:
+        dest: "{{ uat_run_dir }}/logs/{{ _uat_dir }}/diag.yaml"
+        mode: "0644"
+        content: >-
+          {%- set events = [] -%}
+          {%- for e in _uat_events.resources | default([]) -%}
+          {%- set _ = events.append((e.lastTimestamp | default(e.eventTime, true) | default('', true) | string)
+                                    ~ ' ' ~ (e.reason | default('')) ~ ': ' ~ (e.message | default(''))) -%}
+          {%- endfor -%}
+          {{ {
+               'status': _uat_status,
+               'reason': _uat_reason | trim,
+               'pod': (_uat_obj | default({})).status | default({}),
+               'events': events
+             } | to_nice_yaml(indent=2) }}

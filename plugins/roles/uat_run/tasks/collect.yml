@@ -1,0 +1,131 @@
+# Assisted by Claude Opus
+- name: "Prepare to collect from {{ uat_store.namespace }}"
+  ansible.builtin.set_fact:
+    _uat_collector: "uat-collect-{{ uat_run_slug }}-{{ uat_store.role }}"
+    _uat_results: "/uat_workspace/{{ uat_store.basePath }}/{{ uat_run_id }}"
+    _uat_t0: "{{ now().timestamp() }}"
+    _uat_started: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+    _uat_collect_status: done
+    _uat_collect_reason: ""
+
+- name: "Collect results from {{ uat_store.namespace }}"
+  block:
+    - name: Start the collector pod
+      kubernetes.core.k8s:
+        state: present
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: "{{ uat_collect_timeout }}"
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "{{ _uat_collector }}"
+            namespace: "{{ uat_store.namespace }}"
+            labels:
+              app.kubernetes.io/managed-by: "{{ uat_managed_by }}"
+              uat/run: "{{ uat_run_id }}"
+          spec:
+            restartPolicy: Never
+            terminationGracePeriodSeconds: 0
+            tolerations: "{{ uat_tolerations }}"
+            containers:
+              - name: collector
+                image: "{{ uat_collector_image }}"
+                command: [sleep, infinity]
+                volumeMounts:
+                  - name: workspace
+                    mountPath: /uat_workspace
+            volumes:
+              - name: workspace
+                persistentVolumeClaim:
+                  claimName: "{{ uat_store.pvc }}"
+
+    - name: Copy the aggregator into the collector
+      kubernetes.core.k8s_cp:
+        namespace: "{{ uat_store.namespace }}"
+        pod: "{{ _uat_collector }}"
+        state: to_pod
+        local_path: "{{ role_path }}/files/aggregate.py"
+        remote_path: /tmp/aggregate.py
+
+    - name: Aggregate the JUnit reports
+      kubernetes.core.k8s_exec:
+        namespace: "{{ uat_store.namespace }}"
+        pod: "{{ _uat_collector }}"
+        command: sh -c "mkdir -p {{ _uat_results }} && python3 /tmp/aggregate.py {{ _uat_results }}"
+      register: _uat_aggregate
+
+    - name: Pack the results
+      kubernetes.core.k8s_exec:
+        namespace: "{{ uat_store.namespace }}"
+        pod: "{{ _uat_collector }}"
+        command: >-
+          sh -c "mkdir -p /tmp/out &&
+          tar czf /tmp/out/results.tgz -C {{ _uat_results }} --exclude=./scratchpad ."
+
+    - name: Copy the results back
+      kubernetes.core.k8s_cp:
+        namespace: "{{ uat_store.namespace }}"
+        pod: "{{ _uat_collector }}"
+        state: from_pod
+        remote_path: /tmp/out/results.tgz
+        local_path: "{{ uat_run_dir }}/results/{{ uat_store.role }}.tgz"
+
+    - name: Unpack the results
+      ansible.builtin.file:
+        path: "{{ uat_run_dir }}/results/{{ uat_store.role }}"
+        state: directory
+        mode: "0755"
+
+    - name: Extract the results
+      ansible.builtin.unarchive:
+        src: "{{ uat_run_dir }}/results/{{ uat_store.role }}.tgz"
+        dest: "{{ uat_run_dir }}/results/{{ uat_store.role }}"
+        remote_src: true
+
+    - name: Save the aggregator output
+      ansible.builtin.copy:
+        dest: "{{ uat_run_dir }}/logs/collect-{{ uat_store.role }}.log"
+        mode: "0644"
+        content: "{{ _uat_aggregate.stdout | default('') }}{{ _uat_aggregate.stderr | default('') }}"
+
+  rescue:
+    - name: Note the collection failure
+      ansible.builtin.set_fact:
+        _uat_collect_status: error
+        _uat_collect_reason: "{{ ansible_failed_task.name }}: {{ ansible_failed_result.msg | default('') }}"
+
+  always:
+    - name: Delete the collector pod
+      kubernetes.core.k8s:
+        state: absent
+        kind: Pod
+        namespace: "{{ uat_store.namespace }}"
+        name: "{{ _uat_collector }}"
+        wait: true
+        wait_timeout: "{{ uat_delete_timeout }}"
+      failed_when: false
+
+    - name: Record the collection
+      ansible.builtin.copy:
+        dest: "{{ uat_run_dir }}/steps/zzz-collect-{{ uat_store.role }}.json"
+        mode: "0644"
+        content: >-
+          {{ {
+               'run': uat_run_id,
+               'dir': 'collect-' ~ uat_store.role,
+               'step': 'collect',
+               'kind': 'Collect',
+               'namespace': uat_store.namespace,
+               'name': _uat_collector,
+               'status': _uat_collect_status,
+               'reason': _uat_collect_reason,
+               'started': _uat_started,
+               'finished': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ'),
+               'duration_s': ((now().timestamp() - (_uat_t0 | float)) | round(1)),
+               'results_dir': uat_store.basePath ~ '/' ~ uat_run_id,
+               'logs': 'logs/collect-' ~ uat_store.role ~ '.log'
+             } | to_nice_json }}

@@ -1,0 +1,8 @@
+# Assisted by Claude Opus
+galaxy_info:
+  author: AI UAT harness
+  description: Creates one Kubernetes object as a test step (a VM, an InferenceService, a training job, a Service) and records it
+  license: MIT
+  min_ansible_version: "2.16"
+dependencies:
+  - role: uat_config

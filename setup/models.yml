@@ -1,0 +1,191 @@
+# Assisted by Claude Opus
+- name: Download the models onto the models PVCs
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - uat_config
+  vars:
+    uat_models:
+      - ibm-granite/granite-3.3-8b-instruct
+      - Qwen/Qwen2-0.5B
+      - Qwen/Qwen2.5-3B-Instruct
+    uat_models_vm_pvc: uat-models-virt
+    uat_models_timeout: 7200
+    uat_models_script: |
+      set -eu
+      export HOME=/tmp
+      pip install --user huggingface_hub
+      export PATH=$HOME/.local/bin:$PATH
+      for model in {{ uat_models | join(' ') }}; do
+        echo "--- Downloading $model ---"
+        hf download "$model" --local-dir "/models/$model"
+      done
+      echo "=== All downloads complete ==="
+  tasks:
+    - name: List the namespaces with a models PVC
+      ansible.builtin.set_fact:
+        _uat_targets: >-
+          {{ [{'namespace': uat_namespace, 'pvc': uat_storage.models.pvc | default('')}]
+             + ([{'namespace': uat_peer_namespace, 'pvc': uat_peer_storage.models.pvc | default('')}]
+                if uat_peer_namespace | default('') else [])
+             | selectattr('pvc') | list }}
+
+    - name: Start a downloader pod in each namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: model-downloader
+            namespace: "{{ item.namespace }}"
+            labels:
+              app: model-downloader
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: model-downloader
+                image: python:3.12-slim
+                command: [sh, -c, "{{ uat_models_script }}"]
+                volumeMounts:
+                  - {name: models, mountPath: /models}
+            volumes:
+              - name: models
+                persistentVolumeClaim:
+                  claimName: "{{ item.pvc }}"
+      loop: "{{ _uat_targets }}"
+      loop_control:
+        label: "{{ item.namespace }}/{{ item.pvc }}"
+
+    - name: Start the downloader VM that fills the VM disk
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: kubevirt.io/v1
+          kind: VirtualMachine
+          metadata:
+            name: model-downloader-virt
+            namespace: "{{ uat_namespace }}"
+          spec:
+            runStrategy: Once
+            template:
+              spec:
+                domain:
+                  cpu: {cores: 4}
+                  memory: {guest: 8Gi}
+                  devices:
+                    rng: {}
+                    disks:
+                      - {name: rootdisk, disk: {bus: virtio}}
+                      - {name: models, serial: models, disk: {bus: virtio}}
+                      - {name: cloudinit, disk: {bus: virtio}}
+                    interfaces:
+                      - {name: default, masquerade: {}}
+                networks:
+                  - {name: default, pod: {}}
+                volumes:
+                  - name: rootdisk
+                    containerDisk:
+                      image: quay.io/containerdisks/fedora:latest
+                  - name: models
+                    persistentVolumeClaim:
+                      claimName: "{{ uat_models_vm_pvc }}"
+                  - name: cloudinit
+                    cloudInitNoCloud:
+                      userData: |
+                        #cloud-config
+                        packages:
+                          - python3-pip
+                        write_files:
+                          - path: /usr/local/bin/download-models.sh
+                            permissions: "0755"
+                            content: |
+                              #!/bin/bash
+                              set -euo pipefail
+                              DISK=/dev/disk/by-id/virtio-models
+                              blkid "$DISK" || mkfs.xfs -L uat-models "$DISK"
+                              mkdir -p /models
+                              mount "$DISK" /models
+                              pip install huggingface_hub
+                              for model in {{ uat_models | join(' ') }}; do
+                                echo "--- Downloading $model ---"
+                                hf download "$model" --local-dir "/models/$model"
+                              done
+                              sync
+                              umount /models
+                              echo "=== All downloads complete ==="
+                        runcmd:
+                          - /usr/local/bin/download-models.sh 2>&1 | tee /dev/ttyS0
+                          - poweroff
+      when: uat_models_vm_pvc | length > 0
+
+    - name: Wait for the downloader pods
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ item.namespace }}"
+        name: model-downloader
+      register: _uat_downloads
+      until: (_uat_downloads.resources | first | default({})).status.phase | default('') in ['Succeeded', 'Failed']
+      retries: "{{ ((uat_models_timeout | int) / 30) | round(0, 'ceil') | int }}"
+      delay: 30
+      loop: "{{ _uat_targets }}"
+      loop_control:
+        label: "{{ item.namespace }}"
+
+    - name: Wait for the downloader VM to power off
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        namespace: "{{ uat_namespace }}"
+        name: model-downloader-virt
+      register: _uat_vm
+      until: (_uat_vm.resources | first | default({})).status.printableStatus | default('') == 'Stopped'
+      retries: "{{ ((uat_models_timeout | int) / 30) | round(0, 'ceil') | int }}"
+      delay: 30
+      when: uat_models_vm_pvc | length > 0
+
+    - name: Read the downloader logs
+      kubernetes.core.k8s_log:
+        namespace: "{{ item.namespace }}"
+        name: model-downloader
+        tail_lines: 5
+      register: _uat_download_logs
+      loop: "{{ _uat_targets }}"
+      loop_control:
+        label: "{{ item.namespace }}"
+
+    - name: Show the end of each log
+      ansible.builtin.debug:
+        msg: "{{ item.item.namespace }}: {{ item.log_lines }}"
+      loop: "{{ _uat_download_logs.results }}"
+      loop_control:
+        label: "{{ item.item.namespace }}"
+
+    - name: Delete the downloader pods
+      kubernetes.core.k8s:
+        state: absent
+        kind: Pod
+        namespace: "{{ item.namespace }}"
+        name: model-downloader
+        wait: true
+      loop: "{{ _uat_targets }}"
+      loop_control:
+        label: "{{ item.namespace }}"
+
+    - name: Delete the downloader VM
+      kubernetes.core.k8s:
+        state: absent
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        namespace: "{{ uat_namespace }}"
+        name: model-downloader-virt
+        wait: true
+      when: uat_models_vm_pvc | length > 0
+
+    - name: Fail when a download failed
+      ansible.builtin.fail:
+        msg: "Download failed in {{ item.item.namespace }}; see its log above"
+      loop: "{{ _uat_downloads.results }}"
+      loop_control:
+        label: "{{ item.item.namespace }}"
+      when: (item.resources | first).status.phase != 'Succeeded'

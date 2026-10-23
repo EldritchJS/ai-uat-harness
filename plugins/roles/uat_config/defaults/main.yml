@@ -1,0 +1,45 @@
+# Assisted by Claude Opus
+uat_managed_by: uat-harness
+uat_node_selector_key: kubernetes.io/hostname
+uat_tolerations:
+  - key: nvidia.com/gpu.product
+    operator: Exists
+    effect: NoSchedule
+
+uat_builder_image: golang:1.26
+uat_ginkgo_version: v2.32.0
+uat_collector_image: python:3-slim
+
+uat_build_timeout: 1800
+uat_collect_timeout: 600
+uat_deploy_timeout: 600
+uat_default_timeout: 600
+uat_delete_timeout: 300
+uat_poll_interval: 10
+
+uat_on_failure: continue
+uat_preflight: true
+uat_dry_run: false
+
+uat_repo_dir: "{{ ansible_config_file | dirname }}"
+uat_tests_dir: "{{ uat_repo_dir }}/tests"
+uat_runs_dir: "{{ uat_repo_dir }}/runs"
+
+uat_cleanup_kinds:
+  - {api_version: v1, kind: Pod}
+  - {api_version: v1, kind: Service}
+  - {api_version: kubevirt.io/v1, kind: VirtualMachine}
+  - {api_version: serving.kserve.io/v1beta1, kind: InferenceService}
+  - {api_version: serving.kserve.io/v1alpha1, kind: ServingRuntime}
+  - {api_version: kubeflow.org/v1, kind: PyTorchJob}
+  - {api_version: kubeflow.org/v1, kind: TFJob}
+  - {api_version: kubeflow.org/v1, kind: MPIJob}
+  - {api_version: kubeflow.org/v1, kind: XGBoostJob}
+  - {api_version: trainer.kubeflow.org/v1alpha1, kind: TrainJob}
+  - {api_version: jobset.x-k8s.io/v1alpha2, kind: JobSet}
+  - {api_version: ray.io/v1, kind: RayJob}
+  - {api_version: ray.io/v1, kind: RayCluster}
+  - {api_version: ray.io/v1, kind: RayService}
+
+uat_runner_image: registry.access.redhat.com/ubi9/python-311:latest
+uat_runner_timeout: 86400

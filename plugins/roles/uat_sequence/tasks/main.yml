@@ -1,0 +1,30 @@
+# Assisted by Claude Opus
+- name: "Start sequence {{ uat_seq.qid }} of {{ uat_test }}"
+  ansible.builtin.set_fact:
+    services: {}
+    resources: {}
+    resource_name: ""
+    paramSweep:
+      id: ""
+      command: []
+    node: "{{ uat_seq.nodes | first | default('') }}"
+    namespace: "{{ uat_namespace }}"
+    uat_step_counter: 0
+    uat_seq_objects: []
+    uat_seq_failed: false
+    uat_seq_t0: "{{ now().timestamp() }}"
+    uat_seq_started: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+    uat_seq_labels:
+      uat/run: "{{ uat_run_id }}"
+      uat/tid: "{{ uat_tid }}"
+      uat/seq: "{{ uat_seq.qid }}"
+
+- name: "Describe the node of sequence {{ uat_seq.qid }}"
+  ansible.builtin.set_fact:
+    nodeSpec: >-
+      {{ {'name': node, 'componentValidation': hostvars[node].componentValidation | default({})}
+         if node else {} }}
+    scratchpad:
+      pvc: "{{ uat_storage.pvc }}"
+      subPath: "{{ uat_storage.basePath }}/{{ uat_run_id }}/scratchpad/{{ uat_step_prefix }}"
+      mountPath: /uat_scratchpad

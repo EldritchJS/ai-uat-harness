@@ -1,0 +1,106 @@
+# Assisted by Claude Opus
+- name: "Prepare the build of {{ uat_test }} in {{ uat_store.namespace }}"
+  ansible.builtin.set_fact:
+    _uat_builder: "uat-build-{{ uat_run_slug }}-{{ uat_store.role }}"
+    _uat_build_dir: "{{ uat_build_prefix | default(uat_test) }}-build-{{ uat_store.role }}"
+    _uat_builder_starting: false
+    _uat_t0: "{{ now().timestamp() }}"
+    _uat_started: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+    _uat_build_status: error
+    _uat_build_reason: ""
+    _uat_build_log: ""
+
+- name: "Build {{ uat_test }} in {{ uat_store.namespace }}"
+  when: uat_builder_errors[uat_store.role] is not defined
+  block:
+    - name: "Look for the builder in {{ uat_store.namespace }}"
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ uat_store.namespace }}"
+        name: "{{ _uat_builder }}"
+      register: _uat_builder_pod
+
+    - name: "Start the builder in {{ uat_store.namespace }}"
+      ansible.builtin.include_tasks: builder.yml
+      when: >-
+        (_uat_builder_pod.resources | first | default({})).status.phase | default('') != 'Running'
+        or (_uat_builder_pod.resources | first).spec.containers[0].image != uat_builder_image
+
+    - name: "Copy {{ uat_test }}.go into the builder"
+      kubernetes.core.k8s_cp:
+        namespace: "{{ uat_store.namespace }}"
+        pod: "{{ _uat_builder }}"
+        state: to_pod
+        local_path: "{{ uat_tests_dir }}/{{ uat_test }}.go"
+        remote_path: "/src/{{ uat_test }}.go"
+
+    - name: "Compile {{ uat_test }}"
+      kubernetes.core.k8s_exec:
+        namespace: "{{ uat_store.namespace }}"
+        pod: "{{ _uat_builder }}"
+        command: >-
+          timeout {{ uat_build_timeout }} bash /src/compile.sh {{ uat_test | quote }} {{ uat_builds[uat_test] }}
+          {{ uat_ginkgo_version | quote }} {{ ('/uat_workspace/' ~ uat_store.basePath ~ '/builds') | quote }}
+      register: _uat_compile
+      failed_when: false
+
+    - name: "Note the build of {{ uat_test }}"
+      ansible.builtin.set_fact:
+        _uat_build_status: "{{ 'done' if _uat_compile.rc | default(-1) == 0 else 'failed' }}"
+        _uat_build_reason: >-
+          {{ (_uat_compile.stdout_lines | default([]) | select('match', '^(BUILT|CACHED) ') | first | default(''))
+             if _uat_compile.rc | default(-1) == 0
+             else ('timed out after ' ~ uat_build_timeout ~ ' s' if _uat_compile.rc | default(-1) == 124
+             else ('compile.sh exited ' ~ _uat_compile.rc if _uat_compile.rc | default(-1) > 0
+             else _uat_compile.msg | default('the exec into the builder failed'))) }}
+        _uat_build_log: "{{ _uat_compile.stdout | default('') ~ _uat_compile.stderr | default('') }}"
+  rescue:
+    - name: "Note why {{ uat_test }} was not built"
+      ansible.builtin.set_fact:
+        _uat_build_reason: "{{ ansible_failed_task.name }}: {{ ansible_failed_result.msg | default('') }}"
+
+    - name: "Remember that the builder in {{ uat_store.namespace }} did not start"
+      ansible.builtin.set_fact:
+        uat_builder_errors: "{{ uat_builder_errors | combine({uat_store.role: _uat_build_reason}) }}"
+      when: _uat_builder_starting | bool
+
+- name: "Note that the builder in {{ uat_store.namespace }} is not available"
+  ansible.builtin.set_fact:
+    _uat_build_reason: "the builder in {{ uat_store.namespace }} did not start earlier in this run: {{ uat_builder_errors[uat_store.role] }}"
+  when: uat_builder_errors[uat_store.role] is defined and _uat_build_reason | length == 0
+
+- name: "Save the build log of {{ uat_test }}"
+  ansible.builtin.copy:
+    dest: "{{ uat_run_dir }}/logs/{{ _uat_build_dir }}.log"
+    mode: "0644"
+    content: "{{ _uat_build_log }}"
+
+- name: "Record the build of {{ uat_test }}"
+  ansible.builtin.copy:
+    dest: "{{ uat_run_dir }}/steps/{{ _uat_build_dir }}.json"
+    mode: "0644"
+    content: >-
+      {{ {
+           'run': uat_run_id,
+           'tid': _uat_tid | default(''),
+           'test_id': uat_test_counter | default(0) | int,
+           'test': uat_test,
+           'dir': _uat_build_dir,
+           'step': 'build',
+           'kind': 'Build',
+           'namespace': uat_store.namespace,
+           'name': _uat_builder,
+           'status': _uat_build_status,
+           'reason': _uat_build_reason | trim,
+           'started': _uat_started,
+           'finished': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ'),
+           'duration_s': ((now().timestamp() - (_uat_t0 | float)) | round(1)),
+           'results_dir': uat_store.basePath ~ '/builds/' ~ uat_test ~ '/' ~ uat_builds[uat_test],
+           'logs': 'logs/' ~ _uat_build_dir ~ '.log'
+         } | to_nice_json }}
+
+- name: "Note that {{ uat_test }} did not build in {{ uat_store.namespace }}"
+  ansible.builtin.set_fact:
+    _uat_build_failed: "{{ _uat_build_failed + [uat_store.namespace ~ ': ' ~ _uat_build_reason | trim] }}"
+    uat_build_failures: "{{ uat_build_failures + [uat_test ~ ' in ' ~ uat_store.namespace] }}"
+  when: _uat_build_status != 'done'

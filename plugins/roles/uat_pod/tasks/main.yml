@@ -1,0 +1,31 @@
+# Assisted by Claude Opus
+- name: Place the step
+  ansible.builtin.import_role:
+    name: uat_sequence
+    tasks_from: place
+
+- name: "Check the definition of {{ step.name }}"
+  ansible.builtin.assert:
+    that:
+      - step.image is defined
+      - not ((step.persistsThroughSweep | default(false) | bool) and (step.parameterSweep | default(none)) is not none)
+      - (step.labelFilter | default('')) | length == 0 or uat_test in uat_builds
+    fail_msg: >-
+      {{ step.name }}: a pod step needs an image; persistsThroughSweep and parameterSweep
+      cannot both be set; labelFilter needs tests/{{ uat_test }}.go
+    quiet: true
+
+- name: "Run {{ step.name }}"
+  ansible.builtin.include_tasks: launch.yml
+  vars:
+    _uat_entry: {}
+    _uat_index: 0
+  when: (step.parameterSweep | default(none)) is none
+
+- name: "Run each sweep entry of {{ step.name }}"
+  ansible.builtin.include_tasks: launch.yml
+  loop: "{{ step.parameterSweep.entries | default([]) if (step.parameterSweep | default(none)) is not none else [] }}"
+  loop_control:
+    loop_var: _uat_entry
+    index_var: _uat_index
+    label: "{{ _uat_entry.id }}"

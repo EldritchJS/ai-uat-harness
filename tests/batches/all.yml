@@ -1,0 +1,58 @@
+# Assisted by Claude Opus
+- name: platform-check
+  ansible.builtin.import_playbook: ../platform-check.yml
+
+- name: component
+  ansible.builtin.import_playbook: ../component.yml
+
+- name: iperf3
+  ansible.builtin.import_playbook: ../iperf3.yml
+
+- name: iperf3 within each node
+  ansible.builtin.import_playbook: ../iperf3.yml
+  vars:
+    uat_mode: node
+
+- name: iperf3-virt
+  ansible.builtin.import_playbook: ../iperf3-virt.yml
+
+- name: fio
+  ansible.builtin.import_playbook: ../fio.yml
+  vars:
+    uat_mode: serial
+
+- name: fio-virt
+  ansible.builtin.import_playbook: ../fio-virt.yml
+
+- name: dev-env
+  ansible.builtin.import_playbook: ../dev-env.yml
+
+- name: kserve
+  ansible.builtin.import_playbook: ../kserve.yml
+
+- name: guidellm
+  ansible.builtin.import_playbook: ../guidellm.yml
+
+- name: inference-perf
+  ansible.builtin.import_playbook: ../inference-perf.yml
+
+- name: chunked-prefill
+  ansible.builtin.import_playbook: ../chunked-prefill.yml
+
+- name: llm-d-local
+  ansible.builtin.import_playbook: ../llm-d-local.yml
+
+- name: finetune-lora
+  ansible.builtin.import_playbook: ../finetune-lora.yml
+
+- name: ping
+  ansible.builtin.import_playbook: ../ping.yml
+
+- name: peer-load-high
+  ansible.builtin.import_playbook: ../peer-load-high.yml
+
+- name: peer-load-low
+  ansible.builtin.import_playbook: ../peer-load-low.yml
+
+- name: Finish
+  ansible.builtin.import_playbook: ../../plugins/playbooks/finish.yml

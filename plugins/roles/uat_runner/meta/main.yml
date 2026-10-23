@@ -1,0 +1,8 @@
+# Assisted by Claude Opus
+galaxy_info:
+  author: AI UAT harness
+  description: Runs a deploy in a runner pod on the cluster and copies the run back
+  license: MIT
+  min_ansible_version: "2.16"
+dependencies:
+  - role: uat_config

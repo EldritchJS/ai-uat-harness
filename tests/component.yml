@@ -1,0 +1,45 @@
+# Assisted by Claude Opus
+- name: Plan component
+  ansible.builtin.import_playbook: ../plugins/playbooks/sequences.yml
+  vars:
+    uat_test: component
+    uat_modes: [node, serial]
+
+- name: component
+  hosts: "{{ hostvars.localhost.uat_hosts | default('uat_none') }}"
+  serial: "{{ hostvars.localhost.uat_serial | default(0) }}"
+  gather_facts: false
+  tasks:
+    - name: Start the sequence
+      ansible.builtin.import_role:
+        name: uat_sequence
+
+    - name: Steps
+      block:
+        - name: test-runner
+          ansible.builtin.include_role:
+            name: uat_pod
+          vars:
+            step:
+              name: test-runner
+              image: registry.redhat.io/ubi9/ubi:9.8
+              labelFilter: pass-fail
+              resources:
+                requests:
+                  nvidia.com/gpu: '{{ nodeSpec.componentValidation.sanity["nvidia.com/gpu"] }}'
+                limits:
+                  nvidia.com/gpu: '{{ nodeSpec.componentValidation.sanity["nvidia.com/gpu"] }}'
+              env:
+                - name: NODE_NAME
+                  value: "{{ nodeSpec.name }}"
+              privileged: false
+      rescue:
+        - name: Handle the failure
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: failed
+      always:
+        - name: Tear down
+          ansible.builtin.import_role:
+            name: uat_sequence
+            tasks_from: teardown

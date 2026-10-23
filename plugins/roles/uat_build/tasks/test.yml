@@ -1,0 +1,28 @@
+# Assisted by Claude Opus
+- name: "Start the build record of {{ uat_test }}"
+  ansible.builtin.set_fact:
+    _uat_build_failed: []
+
+- name: "Hash {{ uat_test }} with its build inputs"
+  ansible.builtin.set_fact:
+    uat_builds: >-
+      {{ uat_builds | combine({uat_test: ((_uat_source
+           ~ (uat_cluster_spec if 'go:embed cluster.yaml' in _uat_source else '')
+           ~ uat_ginkgo_version ~ uat_builder_image) | hash('sha256'))[:12]}) }}
+  vars:
+    _uat_source: "{{ lookup('ansible.builtin.file', uat_tests_dir ~ '/' ~ uat_test ~ '.go', rstrip=false, errors='ignore') | default('', true) }}"
+  when: uat_go_places[uat_test] | default([]) | length > 0
+
+- name: "Build {{ uat_test }} where it runs"
+  ansible.builtin.include_tasks: build_one.yml
+  loop: "{{ uat_storages | selectattr('role', 'in', uat_go_places[uat_test] | default([])) | list }}"
+  loop_control:
+    loop_var: uat_store
+    label: "{{ uat_store.namespace }}"
+  when: not uat_dry_run | bool
+
+- name: Keep the build hashes with the run
+  ansible.builtin.copy:
+    dest: "{{ uat_run_dir }}/meta/builds.json"
+    mode: "0644"
+    content: "{{ uat_builds | to_nice_json }}"
