@@ -1,11 +1,12 @@
 # Assisted by Claude Opus
-- name: iperf3
-  ansible.builtin.import_playbook: ../iperf3.yml
-  vars:
-    uat_mode: node
+- name: platform-check-virt
+  ansible.builtin.import_playbook: ../platform-check-virt.yml
 
 - name: iperf3-virt
   ansible.builtin.import_playbook: ../iperf3-virt.yml
+
+- name: fio-virt
+  ansible.builtin.import_playbook: ../fio-virt.yml
 
 - name: Finish
   ansible.builtin.import_playbook: ../../plugins/playbooks/finish.yml

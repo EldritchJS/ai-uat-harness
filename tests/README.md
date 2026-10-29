@@ -11,6 +11,7 @@ Platform prerequisites. Checks that must pass before GPU workloads run.
 | Test | Description |
 |------|-------------|
 | [platform-check](#1-platform-check) | RBAC permissions, API groups, and operator CRD registration |
+| [platform-check-virt](#18-platform-check-virt) | RBAC permissions, and OpenShift Virtualization API groups and CRD registration |
 | [component](#3-component) | Node hardware and software validation |
 | [iperf3](#4-iperf3) | Inter-node TCP bandwidth |
 | [iperf3-virt](#14-iperf3-virt) | TCP bandwidth between a pod and a KubeVirt VM on the same node |
@@ -76,6 +77,7 @@ A vertical test detects that something is wrong but cannot say which layer is re
                     (one layer alone)         (several layers together)
                +--------------------------+----------------------------+
                |  platform-check          |  dev-env                   |
+               |  platform-check-virt     |                            |
   Functional   |  component               |  kserve                    |
   (does it     |  ping                    |  finetune-lora             |
    work?)      |                          |                            |
@@ -973,3 +975,63 @@ The scratchpad is how the steps hand data to each other: the steps have no other
 The training job uses a stock PyTorch image, with the training script embedded in the job and the dependencies installed when it starts.
 
 The test supports project mode only.
+
+
+---
+
+## 18. platform-check-virt
+
+### Purpose
+
+This test is the `platform-check` for the virt tests. It checks that OpenShift Virtualization is installed: its API groups, the HyperConverged operator's CRD, and the KubeVirt, CDI and network add-ons CRDs that VMs depend on. It does not check for RHOAI, KServe or Kubeflow, because the virt tests run their workloads in their own VM images.
+
+### Architecture
+
+```
+checker [pass-fail, ephemeral]
+    creates SelfSubjectAccessReviews (RBAC checks)
+    queries API server discovery endpoint (API group and CRD checks)
+```
+
+### Infrastructure
+
+| Name | Image | GPUs | Service | Key config |
+|------|-------|------|---------|------------|
+| checker | `registry.redhat.io/ubi9/ubi:9.8` | none | none | `PERMISSION_CHECKS` env (JSON array of check objects) |
+
+The checks have the same format as in `platform-check`, except that a permission check can also have a `group` for resources outside the core API group.
+
+### Pass-fail assertions
+
+**Permission checks** are expected to be denied:
+
+1. Cannot `get` pods
+2. Cannot `create` pods
+3. Cannot `get` secrets
+4. Cannot `get` nodes
+5. Cannot `create` `virtualmachines.kubevirt.io`
+
+**API group checks:**
+
+6. `kubevirt.io` is present
+7. `subresources.kubevirt.io` is present (virt-api's aggregated API, used for console, VNC and guest agent access)
+8. `cdi.kubevirt.io` is present
+9. `nonexistent.example.io` is absent (negative control)
+
+**CRD checks:**
+
+10. `HyperConverged` in `hco.kubevirt.io/v1beta1` (OpenShift Virtualization operator)
+11. `KubeVirt` in `kubevirt.io/v1`
+12. `VirtualMachine` in `kubevirt.io/v1`
+13. `VirtualMachineInstance` in `kubevirt.io/v1`
+14. `CDI` in `cdi.kubevirt.io/v1beta1` (Containerized Data Importer)
+15. `DataVolume` in `cdi.kubevirt.io/v1beta1`
+16. `NetworkAddonsConfig` in `networkaddonsoperator.network.kubevirt.io/v1` (cluster network add-ons operator)
+
+### Prerequisites
+
+Same as `platform-check`: the default ServiceAccount is enough.
+
+### Design rationale
+
+As in `platform-check`, the CRD checks show that the operators are installed but not that they are healthy. A VM test that fails to start is what shows an unhealthy operator.
